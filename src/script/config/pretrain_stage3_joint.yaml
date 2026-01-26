@@ -1,0 +1,58 @@
+# Stage 3: Joint Fine-tuning
+# Goal: Allow codebook to optimally represent both modalities
+#
+# Training components:
+#   - All components: Train (lower LR for structure path)
+#
+# Losses: All previous losses with balanced weights
+#
+# Note: Structure path uses 0.1x learning rate compared to sequence path
+
+defaults:
+    - pretrain
+
+model:
+    training_stage: 3
+    resume_from_stage: null  # Set to stage 2 checkpoint path
+
+    # Use MCQ quantizer (must match previous stages)
+    quantizer:
+        quantizer_type: MCQQuantizer
+        codebook_embed_size: 128  # Must match encoder.d_out
+        num_codebooks: 8
+        normalize_embeddings: true
+
+    # Enable forward folding (now trains jointly)
+    forward_folding:
+        enabled: true
+        loss_weight: 1.0
+        skip_binned_losses: false  # Can compute binned losses in joint training
+        sequence_encoder:
+            vocab_size: 33
+            d_model: 512
+            n_heads: 8
+            n_layers: 4
+            d_out: 128
+
+    # Enable sequence decoder
+    sequence_decoder:
+        enabled: true
+        d_model: 512
+        n_heads: 8
+        n_layers: 4
+        vocab_size: 33
+        loss_weight: 1.0
+
+    # Enable alignment (may reduce weight in joint training)
+    alignment:
+        enabled: true
+        temperature: 0.1
+        symmetric: true
+        loss_weight: 0.25  # Lower weight in joint training
+
+    function:
+        enabled: false
+
+# Stage 3 specific settings
+experiment_name: stage3_joint
+run_name: stage3_joint_run

@@ -1,0 +1,71 @@
+# Stage 4: Function Integration
+# Goal: Add function modality to unified representation
+#
+# Training components:
+#   - Stages 1-3 components: Initially freeze, then unfreeze
+#   - Function Encoder (NEW): Train
+#   - Function Decoder (NEW): Train
+#
+# Losses: All previous + function reconstruction + function alignment
+#
+# Note: This stage requires implementing FunctionEncoder and FunctionDecoder
+# which are not yet implemented in the current version.
+
+defaults:
+    - pretrain
+
+model:
+    training_stage: 4
+    resume_from_stage: null  # Set to stage 3 checkpoint path
+
+    # Use MCQ quantizer (must match previous stages)
+    quantizer:
+        quantizer_type: MCQQuantizer
+        codebook_embed_size: 128  # Must match encoder.d_out
+        num_codebooks: 8
+        normalize_embeddings: true
+
+    # Keep forward folding enabled (frozen initially)
+    forward_folding:
+        enabled: true
+        loss_weight: 1.0
+        skip_binned_losses: false
+        sequence_encoder:
+            vocab_size: 33
+            d_model: 512
+            n_heads: 8
+            n_layers: 4
+            d_out: 128
+
+    # Keep sequence decoder enabled (frozen initially)
+    sequence_decoder:
+        enabled: true
+        d_model: 512
+        n_heads: 8
+        n_layers: 4
+        vocab_size: 33
+        loss_weight: 1.0
+
+    # Keep alignment enabled
+    alignment:
+        enabled: true
+        temperature: 0.1
+        symmetric: true
+        loss_weight: 0.25
+
+    # Enable function modality (NOT YET IMPLEMENTED)
+    function:
+        enabled: true
+        encoder:
+            d_model: 512
+            n_heads: 8
+            n_layers: 4
+        decoder:
+            d_model: 512
+            n_heads: 8
+            n_layers: 4
+        loss_weight: 1.0
+
+# Stage 4 specific settings
+experiment_name: stage4_function
+run_name: stage4_function_run

@@ -167,6 +167,10 @@ class MCQQuantizer(nn.Module):
 
     Uses multiple independent sub-codebooks, each handling a portion of the
     embedding dimension. This improves codebook utilization and representation capacity.
+
+    Optionally supports modality-specific codebook routing, where different modalities
+    (structure, sequence, function) can be assigned to different codebooks. When a
+    modality is specified during forward(), only the assigned codebooks receive gradients.
     """
 
     def __init__(
@@ -180,6 +184,10 @@ class MCQQuantizer(nn.Module):
         normalize_embeddings: bool = True,
         _need_init: bool = True,
         freeze_codebook: bool = False,
+        # Modality-specific codebook allocation (optional)
+        structure_codebooks: list = None,  # e.g., [0, 1, 2, 3] - codebooks for structure modality
+        sequence_codebooks: list = None,   # e.g., [4, 5] - codebooks for sequence modality
+        shared_codebooks: list = None,     # e.g., [6, 7] - codebooks shared across modalities
         **kwargs
     ):
         super().__init__()
@@ -204,12 +212,60 @@ class MCQQuantizer(nn.Module):
         self._need_init = _need_init
         self.freeze_codebook = freeze_codebook
 
+        # Modality-specific codebook allocation
+        self.structure_codebooks = set(structure_codebooks) if structure_codebooks else None
+        self.sequence_codebooks = set(sequence_codebooks) if sequence_codebooks else None
+        self.shared_codebooks = set(shared_codebooks) if shared_codebooks else None
+
+        # Validate codebook indices if provided
+        all_indices = set(range(num_codebooks))
+        for name, indices in [("structure_codebooks", self.structure_codebooks),
+                              ("sequence_codebooks", self.sequence_codebooks),
+                              ("shared_codebooks", self.shared_codebooks)]:
+            if indices is not None:
+                invalid = indices - all_indices
+                assert not invalid, f"{name} contains invalid indices: {invalid}"
+
         self.codebooks = nn.ModuleList([
             nn.Embedding(self.sub_codebook_size, self.sub_embed_size)
             for _ in range(num_codebooks)
         ])
 
         self.register_buffer('vocab_usage', torch.zeros(num_codebooks, self.sub_codebook_size))
+
+    def _get_active_codebooks_for_modality(self, modality: str = None) -> set:
+        """
+        Get the set of codebook indices that should receive gradients for a given modality.
+
+        Args:
+            modality: "structure", "sequence", or None (all codebooks active)
+
+        Returns:
+            Set of codebook indices that should receive gradients
+        """
+        if modality is None:
+            return set(range(self.num_codebooks))
+
+        active = set()
+
+        if modality == "structure":
+            if self.structure_codebooks is not None:
+                active.update(self.structure_codebooks)
+            else:
+                # If no structure codebooks specified, use all
+                return set(range(self.num_codebooks))
+        elif modality == "sequence":
+            if self.sequence_codebooks is not None:
+                active.update(self.sequence_codebooks)
+            else:
+                # If no sequence codebooks specified, use all
+                return set(range(self.num_codebooks))
+
+        # Always include shared codebooks if specified
+        if self.shared_codebooks is not None:
+            active.update(self.shared_codebooks)
+
+        return active if active else set(range(self.num_codebooks))
 
     def _get_normalized_codebook(self, codebook_idx: int) -> torch.Tensor:
         weight = self.codebooks[codebook_idx].weight
@@ -299,18 +355,39 @@ class MCQQuantizer(nn.Module):
 
         return result
 
-    def forward(self, z: torch.Tensor):
+    def forward(self, z: torch.Tensor, modality: str = None):
+        """
+        Quantize input embeddings through the multi-codebook quantizer.
+
+        Args:
+            z: [B, L, codebook_embed_size] input embeddings
+            modality: Optional modality string ("structure", "sequence", or None).
+                      When specified, only the codebooks assigned to that modality
+                      (plus shared codebooks) receive gradients. Other codebooks
+                      are used in inference mode (no gradient updates).
+                      When None (default), all codebooks receive gradients.
+
+        Returns:
+            quantized_z: [B, L, codebook_embed_size] quantized embeddings
+            quantized_indices: [B, num_codebooks, L] indices for each codebook
+            loss: scalar loss (commitment + quantization)
+            metrics: dict of metric values
+        """
         if self._need_init and self.training:
             self._init_embeddings(z)
 
         batch_size, seq_length, _ = z.shape
         chunks = z.split(self.sub_embed_size, dim=-1)
 
+        # Determine which codebooks should receive gradients
+        active_codebooks = self._get_active_codebooks_for_modality(modality)
+
         all_quantized = []
         all_indices = []
         total_commitment_loss = 0.0
         total_quantization_loss = 0.0
         total_vocab_usage = 0.0
+        num_active_codebooks = 0
 
         for i, chunk in enumerate(chunks):
             flat_chunk = chunk.reshape(-1, self.sub_embed_size)
@@ -320,30 +397,57 @@ class MCQQuantizer(nn.Module):
             else:
                 flat_chunk_norm = flat_chunk
 
-            codebook_weight = self._get_normalized_codebook(i)
+            # Check if this codebook should receive gradients
+            codebook_active = i in active_codebooks
 
-            if self.normalize_embeddings:
-                similarity = flat_chunk_norm @ codebook_weight.T
-                indices = torch.argmax(similarity, dim=1)
+            if codebook_active:
+                # Normal path: codebook receives gradients
+                codebook_weight = self._get_normalized_codebook(i)
+
+                if self.normalize_embeddings:
+                    similarity = flat_chunk_norm @ codebook_weight.T
+                    indices = torch.argmax(similarity, dim=1)
+                else:
+                    dist_sq = (
+                        flat_chunk_norm.square().sum(dim=1, keepdim=True)
+                        + codebook_weight.square().sum(dim=1)
+                        - 2 * flat_chunk_norm @ codebook_weight.T
+                    )
+                    indices = torch.argmin(dist_sq, dim=1)
+
+                quantized = F.embedding(indices, codebook_weight)
+
+                commitment_loss = F.mse_loss(flat_chunk_norm, quantized.detach())
+                quantization_loss = F.mse_loss(quantized, flat_chunk_norm.detach())
+
+                total_commitment_loss += commitment_loss
+                total_quantization_loss += quantization_loss
+                num_active_codebooks += 1
+
+                # Straight-through estimator
+                quantized = flat_chunk_norm + (quantized - flat_chunk_norm).detach()
             else:
-                dist_sq = (
-                    flat_chunk_norm.square().sum(dim=1, keepdim=True)
-                    + codebook_weight.square().sum(dim=1)
-                    - 2 * flat_chunk_norm @ codebook_weight.T
-                )
-                indices = torch.argmin(dist_sq, dim=1)
+                # Inference path: no gradients to codebook
+                with torch.no_grad():
+                    codebook_weight = self._get_normalized_codebook(i)
 
-            quantized = F.embedding(indices, codebook_weight)
+                    if self.normalize_embeddings:
+                        similarity = flat_chunk_norm @ codebook_weight.T
+                        indices = torch.argmax(similarity, dim=1)
+                    else:
+                        dist_sq = (
+                            flat_chunk_norm.square().sum(dim=1, keepdim=True)
+                            + codebook_weight.square().sum(dim=1)
+                            - 2 * flat_chunk_norm @ codebook_weight.T
+                        )
+                        indices = torch.argmin(dist_sq, dim=1)
 
-            commitment_loss = F.mse_loss(flat_chunk_norm, quantized.detach())
-            quantization_loss = F.mse_loss(quantized, flat_chunk_norm.detach())
+                    quantized_detached = F.embedding(indices, codebook_weight)
 
-            total_commitment_loss += commitment_loss
-            total_quantization_loss += quantization_loss
+                # Straight-through: gradient flows to encoder but not to codebook
+                quantized = flat_chunk_norm + (quantized_detached - flat_chunk_norm).detach()
 
-            quantized = flat_chunk_norm + (quantized - flat_chunk_norm).detach()
             quantized = quantized.view(batch_size, seq_length, self.sub_embed_size)
-
             indices = indices.view(batch_size, seq_length)
             all_quantized.append(quantized)
             all_indices.append(indices)
@@ -355,8 +459,13 @@ class MCQQuantizer(nn.Module):
         quantized_z = torch.cat(all_quantized, dim=-1)
         quantized_indices = torch.stack(all_indices, dim=1)
 
-        avg_commitment_loss = total_commitment_loss / self.num_codebooks
-        avg_quantization_loss = total_quantization_loss / self.num_codebooks
+        # Average losses only over active codebooks (avoid division by zero)
+        if num_active_codebooks > 0:
+            avg_commitment_loss = total_commitment_loss / num_active_codebooks
+            avg_quantization_loss = total_quantization_loss / num_active_codebooks
+        else:
+            avg_commitment_loss = torch.tensor(0.0, device=z.device)
+            avg_quantization_loss = torch.tensor(0.0, device=z.device)
 
         loss = (
             self.loss_weight["commitment_loss_weight"] * avg_commitment_loss
@@ -367,6 +476,58 @@ class MCQQuantizer(nn.Module):
             "commitment_loss": avg_commitment_loss,
             "quantization_loss": avg_quantization_loss,
             "vocab_usage": total_vocab_usage / self.num_codebooks,
+            "active_codebooks": num_active_codebooks,
         }
 
         return quantized_z, quantized_indices, loss, metrics
+
+    def get_soft_codebook_logits(
+        self,
+        z: torch.Tensor,
+        temperature: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        Compute soft logits over codebook entries for differentiable cross-modal alignment.
+
+        Instead of returning hard argmax indices, this returns temperature-scaled
+        similarity scores (logits) that can be used for KL divergence computation
+        between modalities.
+
+        Args:
+            z: [B, L, codebook_embed_size] input embeddings
+            temperature: Temperature for scaling logits. Lower = sharper distribution.
+
+        Returns:
+            logits: [B, L, num_codebooks, sub_codebook_size] soft logits over codebook entries
+        """
+        batch_size, seq_length, _ = z.shape
+        chunks = z.split(self.sub_embed_size, dim=-1)
+
+        all_logits = []
+        for i, chunk in enumerate(chunks):
+            flat_chunk = chunk.reshape(-1, self.sub_embed_size)  # [B*L, sub_embed_size]
+
+            if self.normalize_embeddings:
+                flat_chunk = F.normalize(flat_chunk, dim=-1)
+
+            codebook_weight = self._get_normalized_codebook(i)  # [sub_codebook_size, sub_embed_size]
+
+            if self.normalize_embeddings:
+                # Cosine similarity (since both are normalized)
+                similarity = flat_chunk @ codebook_weight.T  # [B*L, sub_codebook_size]
+            else:
+                # Negative L2 distance squared (converted to similarity)
+                dist_sq = (
+                    flat_chunk.square().sum(dim=1, keepdim=True)
+                    + codebook_weight.square().sum(dim=1)
+                    - 2 * flat_chunk @ codebook_weight.T
+                )
+                similarity = -dist_sq  # [B*L, sub_codebook_size]
+
+            # Scale by temperature
+            logits = similarity / temperature  # [B*L, sub_codebook_size]
+            logits = logits.view(batch_size, seq_length, self.sub_codebook_size)  # [B, L, sub_codebook_size]
+            all_logits.append(logits)
+
+        # Stack along codebook dimension: [B, L, num_codebooks, sub_codebook_size]
+        return torch.stack(all_logits, dim=2)

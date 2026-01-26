@@ -17,7 +17,7 @@ model:
             reconstruction_loss_weight: 1.0
             entropy_loss_weight: 0.0  # MCQ only: weight for entropy loss
         codebook_size: 512
-        codebook_embed_size: 1024
+        codebook_embed_size: 128  # Must match encoder.d_out
         _need_init: true
         freeze_codebook: false
         use_linear_project: false
@@ -26,6 +26,12 @@ model:
         use_entropy_loss: false     # Enable entropy loss for better codebook utilization
         entropy_temp: 0.01          # Temperature for entropy loss computation
         normalize_embeddings: true  # L2-normalize embeddings (cosine similarity vs L2)
+        # Modality-specific codebook routing (optional, MCQ only)
+        # When set, different modalities update different subsets of codebooks
+        # Default: null (all codebooks shared, Option C used for forward folding)
+        structure_codebooks: null   # e.g., [0, 1, 2, 3] - codebooks dedicated to structure
+        sequence_codebooks: null    # e.g., [4, 5] - codebooks dedicated to sequence
+        shared_codebooks: null      # e.g., [6, 7] - codebooks shared across modalities
     encoder:
         d_model: 1024
         n_heads: 1
@@ -46,6 +52,40 @@ model:
             n_heads: 8      # Number of attention heads
             n_layers: 4     # Number of transformer layers
             d_out: 128      # Must match encoder.d_out
+
+    # Multi-stage training configuration
+    training_stage: null  # 1, 2, 3, or 4 (null = standard training)
+    resume_from_stage: null  # Path to previous stage checkpoint
+
+    # Sequence decoder for sequence reconstruction (stages 2+)
+    sequence_decoder:
+        enabled: false
+        d_model: 512      # Transformer hidden dimension
+        n_heads: 8        # Number of attention heads
+        n_layers: 4       # Number of transformer layers
+        vocab_size: 33    # ESM3 sequence vocabulary size
+        loss_weight: 1.0  # Weight for sequence reconstruction loss
+
+    # Cross-modal alignment between structure and sequence (stages 2+)
+    alignment:
+        enabled: false
+        temperature: 0.1   # Temperature for soft codebook assignments
+        symmetric: true    # Use symmetric KL divergence
+        loss_weight: 0.5   # Weight for alignment loss
+
+    # Function encoder/decoder (stage 4)
+    function:
+        enabled: false
+        encoder:
+            d_model: 512
+            n_heads: 8
+            n_layers: 4
+        decoder:
+            d_model: 512
+            n_heads: 8
+            n_layers: 4
+        loss_weight: 1.0
+
 deepspeed_path: src/script/config/deepspeed/32_stage2.json
 default_data_dir: null
 tokenizer: null

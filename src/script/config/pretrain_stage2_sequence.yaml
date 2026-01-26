@@ -1,0 +1,61 @@
+# Stage 2: Sequence Encoder Alignment
+# Goal: Teach sequence encoder to map to structure-meaningful tokens
+#
+# Training components:
+#   - Structure Encoder: FROZEN
+#   - Structure Decoder: FROZEN
+#   - Codebook: FROZEN (or low LR)
+#   - Sequence Encoder: Train
+#   - Sequence Decoder (NEW): Train
+#   - Alignment Loss (NEW): Train
+#
+# Losses: Forward folding + sequence reconstruction + cross-modal alignment (KL divergence)
+
+defaults:
+    - pretrain
+
+model:
+    training_stage: 2
+    resume_from_stage: null  # Set to stage 1 checkpoint path
+
+    # Use MCQ quantizer (must match stage 1)
+    quantizer:
+        quantizer_type: MCQQuantizer
+        codebook_embed_size: 128  # Must match encoder.d_out
+        num_codebooks: 8
+        normalize_embeddings: true
+
+    # Enable forward folding for sequence encoder training
+    forward_folding:
+        enabled: true
+        loss_weight: 1.0
+        skip_binned_losses: true  # Save memory since decoder is frozen
+        sequence_encoder:
+            vocab_size: 33
+            d_model: 512
+            n_heads: 8
+            n_layers: 4
+            d_out: 128
+
+    # Enable sequence decoder for reconstruction
+    sequence_decoder:
+        enabled: true
+        d_model: 512
+        n_heads: 8
+        n_layers: 4
+        vocab_size: 33
+        loss_weight: 1.0
+
+    # Enable cross-modal alignment
+    alignment:
+        enabled: true
+        temperature: 0.1
+        symmetric: true
+        loss_weight: 0.5
+
+    function:
+        enabled: false
+
+# Stage 2 specific settings
+experiment_name: stage2_sequence
+run_name: stage2_sequence_run

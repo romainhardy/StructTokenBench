@@ -38,6 +38,7 @@ from vqvae.quantizer_module import *
 from util import get_optimizer
 from contrastive_loss import ProteinFunctionCLIPLoss
 from annotation_loader import AnnotationLoader
+from alignment_loss import CrossModalAlignmentLoss
 
 from vqvae.blocks import VanillaUnifiedTransformerBlock
 from vqvae.transformer_stack import VanillaTransformerStack
@@ -442,6 +443,106 @@ class VanillaSequenceTokenEncoder(nn.Module):
         return z
 
 
+class VanillaSequenceTokenDecoder(nn.Module):
+    """
+    Decoder that reconstructs amino acid sequences from quantized embeddings.
+
+    Takes the quantized latent representation and predicts per-residue amino acid
+    probabilities. This enables training the sequence encoder via sequence
+    reconstruction loss in addition to cross-modal alignment.
+    """
+
+    def __init__(
+        self,
+        encoder_d_out: int,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        vocab_size: int = 33,
+    ):
+        """
+        Args:
+            encoder_d_out: Dimension of quantized embeddings (e.g., 128)
+            d_model: Transformer hidden dimension (e.g., 512)
+            n_heads: Number of attention heads
+            n_layers: Number of transformer layers
+            vocab_size: Size of amino acid vocabulary (default 33 for ESM3)
+        """
+        super().__init__()
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+
+        # Project from quantized dimension to transformer dimension
+        self.post_vq_proj = nn.Linear(encoder_d_out, d_model)
+
+        # Transformer stack for sequence modeling
+        self.decoder_stack = VanillaTransformerStack(
+            d_model=d_model,
+            n_heads=n_heads,
+            v_heads=None,
+            n_layers=n_layers,
+            n_layers_geom=0,
+            scale_residue=False,
+        )
+
+        # Output projection to vocabulary
+        self.output_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, vocab_size),
+        )
+
+    def decode(
+        self,
+        quantized_z: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        sequence_id: torch.Tensor | None = None,
+    ) -> dict:
+        """
+        Decode quantized embeddings to amino acid logits.
+
+        Args:
+            quantized_z: [B, L, encoder_d_out] quantized embeddings
+            attention_mask: [B, L] boolean mask, True for valid positions
+            sequence_id: [B, L] optional sequence IDs
+
+        Returns:
+            Dictionary with:
+                - logits: [B, L, vocab_size] amino acid logits
+                - last_hidden_state: [B, L, d_model] transformer output
+        """
+        batch_size, seq_length, _ = quantized_z.shape
+
+        if sequence_id is None:
+            sequence_id = torch.zeros(
+                batch_size, seq_length, dtype=torch.int64, device=quantized_z.device
+            )
+
+        # Project to transformer dimension
+        x = self.post_vq_proj(quantized_z)  # [B, L, d_model]
+
+        # Pass through transformer
+        chain_id = torch.zeros_like(sequence_id)
+        x, _ = self.decoder_stack.forward(
+            x=x,
+            attention_mask=attention_mask,
+            sequence_id=sequence_id,
+            affine=None,
+            affine_mask=None,
+            chain_id=chain_id,
+        )  # [B, L, d_model]
+
+        # Project to vocabulary
+        logits = self.output_head(x)  # [B, L, vocab_size]
+
+        return {
+            "logits": logits,
+            "last_hidden_state": x,
+        }
+
+
 class VanillaStructureTokenDecoder(nn.Module):
     """
     Reference: https://github.com/evolutionaryscale/esm/blob/2efdadfe77ddbb7f36459e44d158531b4407441f/esm/models/vqvae.py#L335
@@ -580,6 +681,9 @@ class VQVAEModel(nn.Module):
 
         self._step_count = 0
 
+        # Multi-stage training support
+        self.training_stage = model_cfg.get("training_stage", None)
+
         # Initialize contrastive loss if configured
         contrastive_cfg = model_cfg.get("contrastive", None)
         self.use_contrastive = contrastive_cfg is not None and contrastive_cfg.get("enabled", False)
@@ -615,6 +719,35 @@ class VQVAEModel(nn.Module):
                 d_out=seq_enc_cfg.d_out,
             )
 
+        # Initialize sequence decoder if configured (for sequence reconstruction in stages 2+)
+        seq_decoder_cfg = model_cfg.get("sequence_decoder", None)
+        self.use_sequence_decoder = seq_decoder_cfg is not None and seq_decoder_cfg.get("enabled", False)
+
+        if self.use_sequence_decoder:
+            self.sequence_decoder_loss_weight = seq_decoder_cfg.get("loss_weight", 1.0)
+            self.sequence_decoder = VanillaSequenceTokenDecoder(
+                encoder_d_out=model_cfg.encoder.d_out,
+                d_model=seq_decoder_cfg.get("d_model", 512),
+                n_heads=seq_decoder_cfg.get("n_heads", 8),
+                n_layers=seq_decoder_cfg.get("n_layers", 4),
+                vocab_size=seq_decoder_cfg.get("vocab_size", 33),
+            )
+
+        # Initialize cross-modal alignment if configured (for stages 2+)
+        alignment_cfg = model_cfg.get("alignment", None)
+        self.use_alignment = alignment_cfg is not None and alignment_cfg.get("enabled", False)
+
+        if self.use_alignment:
+            self.alignment_loss_weight = alignment_cfg.get("loss_weight", 0.5)
+            self.alignment_loss = CrossModalAlignmentLoss(
+                temperature=alignment_cfg.get("temperature", 0.1),
+                symmetric=alignment_cfg.get("symmetric", True),
+            )
+
+        # Apply stage-specific freezing
+        if self.training_stage is not None:
+            self._apply_stage_freezing()
+
     def forward(self, input_list, use_as_tokenizer=False):
         self._step_count += 1
 
@@ -639,7 +772,7 @@ class VQVAEModel(nn.Module):
         # residue_index: torch.Tensor | None = None,
         z = self.encoder.encode(coords, attention_mask, sequence_id, residue_index)
         assert self.quantizer.codebook_embed_size == self.encoder.d_out
-        quantized_z, quantized_indices, partial_loss, partial_metrics = self.quantizer(z)
+        quantized_z, quantized_indices, partial_loss, partial_metrics = self.quantizer(z, modality="structure")
         assert not z.isnan().any() and not quantized_indices.isnan().any()
         if use_as_tokenizer:
             return quantized_z, quantized_indices, z
@@ -713,29 +846,41 @@ class VQVAEModel(nn.Module):
             # Encode sequence
             z_seq = self.sequence_encoder.encode(seq_residue_tokens, attention_mask, sequence_id)
 
-            # Option C: Stop gradients to codebooks for sequence path
-            # The sequence encoder learns to produce embeddings that match the
-            # structure-optimized codebooks, but doesn't modify the codebooks themselves
-            with torch.no_grad():
-                # Get indices without updating codebooks
-                quantized_indices_seq = self.quantizer.embedding2indices(z_seq)
-                # Look up embeddings from codebooks (detached)
-                quantized_z_seq_detached = self.quantizer.indices2embedding(quantized_indices_seq)
+            # Check if modality-specific codebook routing is configured
+            has_modality_routing = (
+                hasattr(self.quantizer, 'sequence_codebooks') and
+                self.quantizer.sequence_codebooks is not None
+            )
 
-            # Straight-through estimator: gradient flows to z_seq (sequence encoder)
-            # but not to codebooks. Forward pass uses quantized values.
-            quantized_z_seq = z_seq + (quantized_z_seq_detached - z_seq).detach()
+            if has_modality_routing:
+                # Modality-specific routing: sequence-dedicated + shared codebooks receive gradients
+                # Structure-dedicated codebooks are used in inference mode (no gradient updates)
+                quantized_z_seq, quantized_indices_seq, partial_loss_seq, partial_metrics_seq = self.quantizer(
+                    z_seq, modality="sequence"
+                )
+            else:
+                # Option C: Stop ALL gradients to codebooks for sequence path
+                # The sequence encoder learns to produce embeddings that match the
+                # structure-optimized codebooks, but doesn't modify the codebooks themselves
+                with torch.no_grad():
+                    # Get indices without updating codebooks
+                    quantized_indices_seq = self.quantizer.embedding2indices(z_seq)
+                    # Look up embeddings from codebooks (detached)
+                    quantized_z_seq_detached = self.quantizer.indices2embedding(quantized_indices_seq)
 
-            # Compute commitment loss for sequence encoder (encourages z_seq to be close to codebook entries)
-            # Note: Only z_seq receives gradients here, not the codebooks
-            commitment_loss_seq = F.mse_loss(z_seq, quantized_z_seq_detached.detach())
+                # Straight-through estimator: gradient flows to z_seq (sequence encoder)
+                # but not to codebooks. Forward pass uses quantized values.
+                quantized_z_seq = z_seq + (quantized_z_seq_detached - z_seq).detach()
 
-            # Metrics for sequence quantization path
-            partial_loss_seq = commitment_loss_seq * self.loss_weight.get("commitment_loss_weight", 0.25)
-            partial_metrics_seq = {
-                "commitment_loss": commitment_loss_seq,
-                "vocab_usage": torch.tensor(0.0, device=coords.device),  # Not tracking for seq path
-            }
+                # Compute commitment loss for sequence encoder
+                commitment_loss_seq = F.mse_loss(z_seq, quantized_z_seq_detached.detach())
+
+                # Metrics for sequence quantization path
+                partial_loss_seq = commitment_loss_seq * self.loss_weight.get("commitment_loss_weight", 0.25)
+                partial_metrics_seq = {
+                    "commitment_loss": commitment_loss_seq,
+                    "vocab_usage": torch.tensor(0.0, device=coords.device),
+                }
 
             # Get decoder structure tokens
             if quantized_indices_seq.dim() == 3:
@@ -744,43 +889,51 @@ class VQVAEModel(nn.Module):
                 decoder_structure_tokens_seq = quantized_indices_seq
 
             # Decode sequence embeddings to predict structure
-            # Skip pairwise head if binned losses are skipped to save memory
-            decoded_states_seq = self.decoder.decode(
-                quantized_z_seq, decoder_structure_tokens_seq, attention_mask, sequence_id,
-                skip_pairwise=self.forward_folding_skip_binned
-            )
-
-            # Compute forward folding losses
-            coords_pred_from_seq = decoded_states_seq["bb_pred"]
-
-            ff_geom_dist_loss, ff_geom_dist_metrics = self.compute_geometric_distance(
-                coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone()
-            )
-            ff_geom_dir_loss, ff_geom_dir_metrics = self.compute_geometric_direction(
-                coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone()
-            )
-
-            # Optionally skip binned losses to save memory
-            if self.forward_folding_skip_binned:
-                ff_binned_dist_loss = torch.tensor(0.0, device=coords.device)
-                ff_binned_dir_loss = torch.tensor(0.0, device=coords.device)
-                ff_binned_dist_metrics = {}
-                ff_binned_dir_metrics = {}
-            else:
-                ff_binned_dist_loss, ff_binned_dist_metrics = self.compute_binned_distance(
-                    decoded_states_seq["pairwise_dist_logits"], coords.clone(), attention_mask.clone()
-                )
-                ff_binned_dir_loss, ff_binned_dir_metrics = self.compute_binned_direction(
-                    decoded_states_seq["pairwise_dir_logits"], coords[:, :, :3, :].clone(), attention_mask.clone()
+            # MEMORY OPTIMIZATION: Run decoder without storing activations for backward pass.
+            # The decoder is shared and already trained via the structure reconstruction path.
+            # The sequence encoder is trained via commitment loss (encouraging z_seq to match
+            # codebook entries). The structure prediction here serves as a monitoring metric
+            # but doesn't directly backprop through the decoder to save memory.
+            with torch.no_grad():
+                decoded_states_seq = self.decoder.decode(
+                    quantized_z_seq.detach(), decoder_structure_tokens_seq, attention_mask, sequence_id,
+                    skip_pairwise=self.forward_folding_skip_binned
                 )
 
-            # Combine forward folding losses
-            forward_folding_loss = (
+                # Compute forward folding losses (for monitoring, not gradient computation)
+                coords_pred_from_seq = decoded_states_seq["bb_pred"]
+
+                ff_geom_dist_loss, ff_geom_dist_metrics = self.compute_geometric_distance(
+                    coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone()
+                )
+                ff_geom_dir_loss, ff_geom_dir_metrics = self.compute_geometric_direction(
+                    coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone()
+                )
+
+                # Optionally skip binned losses to save memory
+                if self.forward_folding_skip_binned:
+                    ff_binned_dist_loss = torch.tensor(0.0, device=coords.device)
+                    ff_binned_dir_loss = torch.tensor(0.0, device=coords.device)
+                    ff_binned_dist_metrics = {}
+                    ff_binned_dir_metrics = {}
+                else:
+                    ff_binned_dist_loss, ff_binned_dist_metrics = self.compute_binned_distance(
+                        decoded_states_seq["pairwise_dist_logits"], coords.clone(), attention_mask.clone()
+                    )
+                    ff_binned_dir_loss, ff_binned_dir_metrics = self.compute_binned_direction(
+                        decoded_states_seq["pairwise_dir_logits"], coords[:, :, :3, :].clone(), attention_mask.clone()
+                    )
+
+            # Structure prediction loss (monitoring only, computed in no_grad block above)
+            ff_structure_loss = (
                 ff_geom_dist_loss + ff_geom_dir_loss + ff_binned_dist_loss + ff_binned_dir_loss
             ).mean()
 
-            # Add quantization losses from sequence path
-            forward_folding_loss = forward_folding_loss + partial_loss_seq
+            # The actual trainable loss is the commitment loss from the sequence path.
+            # This trains the sequence encoder to produce embeddings close to codebook entries.
+            # The structure prediction metrics above monitor whether those entries lead to
+            # good structure predictions (the decoder is trained via the structure path).
+            forward_folding_loss = partial_loss_seq
 
             # Prefix all metrics with ff_
             forward_folding_metrics = {
@@ -792,10 +945,41 @@ class VQVAEModel(nn.Module):
                 }.items()
             }
             forward_folding_metrics.update({f"ff_seq_{k}": v for k, v in partial_metrics_seq.items()})
+            forward_folding_metrics["ff_structure_loss"] = ff_structure_loss  # For monitoring
             forward_folding_metrics["forward_folding_loss"] = forward_folding_loss
 
-            # Add forward folding to total loss
+            # Add forward folding to total loss (only commitment loss contributes gradients)
             loss = loss + self.forward_folding_loss_weight * forward_folding_loss
+
+        # Sequence reconstruction (if enabled, for stages 2+)
+        seq_recon_metrics = {}
+        if self.use_sequence_decoder and self.use_forward_folding:
+            # Use the sequence encoder's quantized output for sequence reconstruction
+            seq_recon_loss, seq_recon_metrics = self.compute_sequence_reconstruction(
+                quantized_z_seq, seq_residue_tokens, attention_mask, sequence_id
+            )
+            loss = loss + self.sequence_decoder_loss_weight * seq_recon_loss
+
+        # Cross-modal alignment (if enabled, for stages 2+)
+        alignment_metrics = {}
+        if self.use_alignment and self.use_forward_folding and hasattr(self.quantizer, 'get_soft_codebook_logits'):
+            # Get soft logits from both structure and sequence encoders
+            alignment_temp = self.model_cfg.get("alignment", {}).get("temperature", 0.1)
+
+            # Structure encoder soft logits (detached - we align sequence TO structure)
+            with torch.no_grad():
+                structure_soft_logits = self.quantizer.get_soft_codebook_logits(z, temperature=alignment_temp)
+
+            # Sequence encoder soft logits (receives gradients)
+            sequence_soft_logits = self.quantizer.get_soft_codebook_logits(z_seq, temperature=alignment_temp)
+
+            # Compute alignment loss
+            alignment_loss, alignment_metrics = self.alignment_loss(
+                source_logits=sequence_soft_logits,
+                target_logits=structure_soft_logits,
+                attention_mask=attention_mask,
+            )
+            loss = loss + self.alignment_loss_weight * alignment_loss
 
         metrics = {
             **geom_dist_metrics,
@@ -806,12 +990,14 @@ class VQVAEModel(nn.Module):
             **partial_metrics,
             **contrastive_metrics,
             **forward_folding_metrics,
+            **seq_recon_metrics,
+            **alignment_metrics,
             "reconstruction_loss": reconstruction_loss,
             "bb_rmsd": torch.tensor(bb_rmsd_list, device=coords.device).mean(),
             "lddt": torch.tensor(lddt_list, device=coords.device).mean(),
         }
         loss_and_metrics = (loss, metrics)
-        
+
         return (loss_and_metrics, )
     
     def compute_geometric_distance(self, x_recon, x, attention_mask, clamp_value=25):
@@ -977,21 +1163,195 @@ class VQVAEModel(nn.Module):
         attention_mask: [B, L]
         """
         logits = self.inverse_folding_head(h) # [B, L, num_AAs]
-        
+
         if not (logits.shape[0] == attention_mask.shape[0] and logits.shape[1] == attention_mask.shape[1]):
             raise ValueError
-        
+
         logits, residue_labels = logits[attention_mask], residue_labels[attention_mask]
-        
+
         loss_fct = nn.CrossEntropyLoss(reduction="none")
         loss = loss_fct(logits, residue_labels)
-        
+
         metric = {
             f"inverse_folding_loss": loss.mean(),
             f"inverse_folding_accuracy": (logits.argmax(dim=-1) == residue_labels).float().mean(),
         }
         return loss.mean(), metric
-    
+
+    def compute_sequence_reconstruction(self, quantized_z, seq_residue_tokens, attention_mask, sequence_id=None):
+        """
+        Compute sequence reconstruction loss from quantized embeddings.
+
+        Args:
+            quantized_z: [B, L, d_out] quantized embeddings
+            seq_residue_tokens: [B, L] target amino acid tokens
+            attention_mask: [B, L] boolean mask
+            sequence_id: [B, L] optional sequence IDs
+
+        Returns:
+            loss: scalar reconstruction loss
+            metrics: dictionary with accuracy and other metrics
+        """
+        if not self.use_sequence_decoder:
+            return torch.tensor(0.0, device=quantized_z.device), {}
+
+        decoded_seq = self.sequence_decoder.decode(quantized_z, attention_mask, sequence_id)
+        logits = decoded_seq["logits"]  # [B, L, vocab_size]
+
+        # Flatten for loss computation
+        logits_flat = logits[attention_mask]  # [N, vocab_size]
+        targets_flat = seq_residue_tokens[attention_mask]  # [N]
+
+        loss_fct = nn.CrossEntropyLoss(reduction="none")
+        loss = loss_fct(logits_flat, targets_flat)
+
+        with torch.no_grad():
+            preds = logits_flat.argmax(dim=-1)
+            accuracy = (preds == targets_flat).float().mean()
+
+        metrics = {
+            "seq_recon_loss": loss.mean(),
+            "seq_recon_accuracy": accuracy,
+        }
+
+        return loss.mean(), metrics
+
+    def _apply_stage_freezing(self):
+        """
+        Apply component freezing based on training stage.
+
+        Stage 1: Train structure encoder/decoder, codebook, inverse folding
+        Stage 2: Freeze structure path, train sequence encoder/decoder, alignment
+        Stage 3: Unfreeze all (joint fine-tuning with lower LR for structure path)
+        Stage 4: Initially freeze stages 1-3, train function encoder/decoder
+        """
+        stage = self.training_stage
+
+        if stage == 1:
+            # Stage 1: Structure foundation - everything trains normally
+            pass
+
+        elif stage == 2:
+            # Stage 2: Freeze structure encoder, decoder, and codebook
+            # Train sequence encoder, sequence decoder, alignment
+            self._freeze_module(self.encoder)
+            self._freeze_module(self.decoder)
+            self._freeze_module(self.quantizer)
+            self._freeze_module(self.inverse_folding_head)
+
+        elif stage == 3:
+            # Stage 3: Joint fine-tuning - everything unfrozen
+            # LR adjustments handled in get_parameter_groups()
+            pass
+
+        elif stage == 4:
+            # Stage 4: Function integration
+            # Initially freeze structure/sequence paths, train function
+            # (can be unfrozen later in training)
+            self._freeze_module(self.encoder)
+            self._freeze_module(self.decoder)
+            self._freeze_module(self.quantizer)
+            if self.use_forward_folding:
+                self._freeze_module(self.sequence_encoder)
+            if self.use_sequence_decoder:
+                self._freeze_module(self.sequence_decoder)
+
+    def _freeze_module(self, module: nn.Module):
+        """Freeze all parameters in a module."""
+        for param in module.parameters():
+            param.requires_grad = False
+
+    def _unfreeze_module(self, module: nn.Module):
+        """Unfreeze all parameters in a module."""
+        for param in module.parameters():
+            param.requires_grad = True
+
+    def get_parameter_groups(self, base_lr: float = 1e-4):
+        """
+        Get parameter groups with stage-specific learning rates.
+
+        For Stage 3 (joint fine-tuning), structure path gets lower LR.
+
+        Args:
+            base_lr: Base learning rate
+
+        Returns:
+            List of parameter group dicts for optimizer
+        """
+        stage = self.training_stage
+
+        if stage == 3:
+            # Stage 3: Lower LR for structure path (0.1x), normal LR for sequence path
+            structure_params = []
+            sequence_params = []
+            other_params = []
+
+            structure_modules = [self.encoder, self.decoder, self.quantizer, self.inverse_folding_head]
+            sequence_modules = []
+            if self.use_forward_folding:
+                sequence_modules.append(self.sequence_encoder)
+            if self.use_sequence_decoder:
+                sequence_modules.append(self.sequence_decoder)
+            if self.use_alignment:
+                sequence_modules.append(self.alignment_loss)
+
+            structure_param_set = set()
+            for module in structure_modules:
+                for param in module.parameters():
+                    structure_param_set.add(id(param))
+                    if param.requires_grad:
+                        structure_params.append(param)
+
+            sequence_param_set = set()
+            for module in sequence_modules:
+                for param in module.parameters():
+                    sequence_param_set.add(id(param))
+                    if param.requires_grad:
+                        sequence_params.append(param)
+
+            # Other params (contrastive, etc.)
+            for param in self.parameters():
+                param_id = id(param)
+                if param_id not in structure_param_set and param_id not in sequence_param_set:
+                    if param.requires_grad:
+                        other_params.append(param)
+
+            return [
+                {"params": structure_params, "lr": base_lr * 0.1, "name": "structure_path"},
+                {"params": sequence_params, "lr": base_lr, "name": "sequence_path"},
+                {"params": other_params, "lr": base_lr, "name": "other"},
+            ]
+
+        else:
+            # Default: all params get same LR
+            return [{"params": [p for p in self.parameters() if p.requires_grad], "lr": base_lr}]
+
+    def get_frozen_components(self) -> list[str]:
+        """Return list of component names that are currently frozen."""
+        frozen = []
+        components = [
+            ("encoder", self.encoder),
+            ("decoder", self.decoder),
+            ("quantizer", self.quantizer),
+            ("inverse_folding_head", self.inverse_folding_head),
+        ]
+
+        if self.use_forward_folding:
+            components.append(("sequence_encoder", self.sequence_encoder))
+        if self.use_sequence_decoder:
+            components.append(("sequence_decoder", self.sequence_decoder))
+        if self.use_contrastive:
+            components.append(("clip_loss", self.clip_loss))
+        if self.use_alignment:
+            components.append(("alignment_loss", self.alignment_loss))
+
+        for name, module in components:
+            all_frozen = all(not p.requires_grad for p in module.parameters())
+            if all_frozen and len(list(module.parameters())) > 0:
+                frozen.append(name)
+
+        return frozen
+
 
 class LightningVQPretrainModel(pl.LightningModule):
     """
@@ -1039,6 +1399,25 @@ class LightningVQPretrainModel(pl.LightningModule):
             "training_loss_step", loss, on_step=True, on_epoch=False, prog_bar=True,
             batch_size=self.optimizer_cfg.micro_batch_size, logger=True, sync_dist=True,
         )
+
+        # Log key metrics for monitoring
+        metrics_to_log = [
+            "reconstruction_loss", "bb_rmsd", "lddt", "vocab_usage",
+            "ff_structure_loss", "forward_folding_loss", "ff_seq_commitment_loss",
+            "contrastive_loss", "contrastive_accuracy",
+            # Multi-stage training metrics
+            "seq_recon_loss", "seq_recon_accuracy",
+            "align_kl_loss", "align_token_agreement_rate",
+        ]
+        for key in metrics_to_log:
+            if key in metrics and metrics[key] is not None:
+                value = metrics[key]
+                if hasattr(value, 'item'):
+                    value = value.item()
+                self.log(
+                    f"train/{key}", value, on_step=True, on_epoch=False,
+                    batch_size=self.optimizer_cfg.micro_batch_size, logger=True, sync_dist=True,
+                )
 
         return {"loss": loss}
 
@@ -1146,27 +1525,76 @@ class LightningVQPretrainModel(pl.LightningModule):
         # use trainer logger which ensures it is mstar logger
         # self.trainer.logger.log_hyperparams(self.full_experiment_config)
 
-        # create the optimizer, exclude "bias", "LayerNorm" from decaying
-        decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm])
-        # filter out bias
-        decay_parameters = [name for name in decay_parameters if "bias" not in name]
-        # filter out layernorm with a variety of spellings
-        decay_parameters = [name for name in decay_parameters if "layer_norm" not in name]
-        decay_parameters = [name for name in decay_parameters if "layernorm" not in name]
-        
-        params_decay = [p for n, p in self.model.named_parameters() if (any(nd in n for nd in decay_parameters))]
-        params_nodecay = [p for n, p in self.model.named_parameters() if (not any(nd in n for nd in decay_parameters))]
-        
-        param_groups = [
-            {
-                "params": params_decay,
-                "weight_decay": self.optimizer_cfg.optimizer.weight_decay,
-            },
-            {
-                "params": params_nodecay, 
-                "weight_decay": 0.0
-            },
-        ]
+        # Check if using multi-stage training with stage-specific LRs
+        training_stage = self.model_cfg.get("training_stage", None)
+        base_lr = self.optimizer_cfg.optimizer.lr
+
+        if training_stage == 3 and hasattr(self.model, 'get_parameter_groups'):
+            # Stage 3: Use model's parameter groups for differential LRs
+            stage_param_groups = self.model.get_parameter_groups(base_lr)
+
+            # Apply weight decay settings to stage param groups
+            decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm])
+            decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            decay_parameters = [name for name in decay_parameters if "layer_norm" not in name]
+            decay_parameters = [name for name in decay_parameters if "layernorm" not in name]
+
+            param_groups = []
+            for group in stage_param_groups:
+                group_params = group["params"]
+                group_lr = group.get("lr", base_lr)
+                group_name = group.get("name", "default")
+
+                # Split into decay/no-decay within this group
+                decay_params = []
+                nodecay_params = []
+                for p in group_params:
+                    # Find param name
+                    param_name = None
+                    for n, param in self.model.named_parameters():
+                        if param is p:
+                            param_name = n
+                            break
+                    if param_name and any(nd in param_name for nd in decay_parameters):
+                        decay_params.append(p)
+                    else:
+                        nodecay_params.append(p)
+
+                if decay_params:
+                    param_groups.append({
+                        "params": decay_params,
+                        "lr": group_lr,
+                        "weight_decay": self.optimizer_cfg.optimizer.weight_decay,
+                    })
+                if nodecay_params:
+                    param_groups.append({
+                        "params": nodecay_params,
+                        "lr": group_lr,
+                        "weight_decay": 0.0,
+                    })
+        else:
+            # Default: standard parameter groups
+            decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm])
+            # filter out bias
+            decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            # filter out layernorm with a variety of spellings
+            decay_parameters = [name for name in decay_parameters if "layer_norm" not in name]
+            decay_parameters = [name for name in decay_parameters if "layernorm" not in name]
+
+            params_decay = [p for n, p in self.model.named_parameters() if (any(nd in n for nd in decay_parameters)) and p.requires_grad]
+            params_nodecay = [p for n, p in self.model.named_parameters() if (not any(nd in n for nd in decay_parameters)) and p.requires_grad]
+
+            param_groups = [
+                {
+                    "params": params_decay,
+                    "weight_decay": self.optimizer_cfg.optimizer.weight_decay,
+                },
+                {
+                    "params": params_nodecay,
+                    "weight_decay": 0.0
+                },
+            ]
+
         optimizer = get_optimizer(param_groups, self.optimizer_cfg.optimizer)
 
         scheduler = hydra.utils.call(self.optimizer_cfg.scheduler, optimizer=optimizer)
