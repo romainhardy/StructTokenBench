@@ -713,8 +713,29 @@ class VQVAEModel(nn.Module):
             # Encode sequence
             z_seq = self.sequence_encoder.encode(seq_residue_tokens, attention_mask, sequence_id)
 
-            # Quantize through SAME codebooks
-            quantized_z_seq, quantized_indices_seq, partial_loss_seq, partial_metrics_seq = self.quantizer(z_seq)
+            # Option C: Stop gradients to codebooks for sequence path
+            # The sequence encoder learns to produce embeddings that match the
+            # structure-optimized codebooks, but doesn't modify the codebooks themselves
+            with torch.no_grad():
+                # Get indices without updating codebooks
+                quantized_indices_seq = self.quantizer.embedding2indices(z_seq)
+                # Look up embeddings from codebooks (detached)
+                quantized_z_seq_detached = self.quantizer.indices2embedding(quantized_indices_seq)
+
+            # Straight-through estimator: gradient flows to z_seq (sequence encoder)
+            # but not to codebooks. Forward pass uses quantized values.
+            quantized_z_seq = z_seq + (quantized_z_seq_detached - z_seq).detach()
+
+            # Compute commitment loss for sequence encoder (encourages z_seq to be close to codebook entries)
+            # Note: Only z_seq receives gradients here, not the codebooks
+            commitment_loss_seq = F.mse_loss(z_seq, quantized_z_seq_detached.detach())
+
+            # Metrics for sequence quantization path
+            partial_loss_seq = commitment_loss_seq * self.loss_weight.get("commitment_loss_weight", 0.25)
+            partial_metrics_seq = {
+                "commitment_loss": commitment_loss_seq,
+                "vocab_usage": torch.tensor(0.0, device=coords.device),  # Not tracking for seq path
+            }
 
             # Get decoder structure tokens
             if quantized_indices_seq.dim() == 3:

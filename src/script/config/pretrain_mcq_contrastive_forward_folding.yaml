@@ -22,7 +22,7 @@ model:
     forward_folding:
         enabled: true
         loss_weight: 1.0
-        skip_binned_losses: true  # Skip binned losses to save memory
+        skip_binned_losses: false  # Re-enabled binned losses with Option C (stop gradients to codebooks)
         sequence_encoder:
             vocab_size: 33
             d_model: 512
