@@ -1,0 +1,22 @@
+defaults:
+    - pretrain
+
+model:
+    quantizer:
+        quantizer_type: MCQQuantizer
+        num_codebooks: 8
+        codebook_size: 512
+        codebook_embed_size: 128
+        normalize_embeddings: true
+        use_entropy_loss: false
+
+    contrastive:
+        enabled: true
+        loss_weight: 0.1
+        annotation_path: /lambda/nfs/rhardy-us-east-1/code/protein/data/annotations/training_chain_annotations.json
+        text_model: microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract
+        shared_dim: 512
+        learnable_temperature: true
+        freeze_text_encoder: true
+
+experiment_name: mcq_contrastive

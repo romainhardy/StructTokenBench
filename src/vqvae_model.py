@@ -3,6 +3,7 @@ import math
 import time
 import json
 import hydra
+import numpy as np
 
 import pytorch_lightning as pl
 import torch
@@ -12,8 +13,8 @@ import safetensors
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from transformers.trainer_pt_utils import get_parameter_names
-from transformers import AutoConfig, AdamW, EsmModel
-from torch.optim import Adam
+from transformers import AutoConfig, EsmModel
+from torch.optim import Adam, AdamW
 import torch.nn.functional as F
 import deepspeed
 from pytorch_lightning.utilities import grad_norm
@@ -35,6 +36,8 @@ from esm.utils.structure.protein_structure import infer_cbeta_from_atom37
 from modeling_util import model_init_fn
 from vqvae.quantizer_module import *
 from util import get_optimizer
+from contrastive_loss import ProteinFunctionCLIPLoss
+from annotation_loader import AnnotationLoader
 
 from vqvae.blocks import VanillaUnifiedTransformerBlock
 from vqvae.transformer_stack import VanillaTransformerStack
@@ -377,6 +380,68 @@ class VanillaRegressionHead(nn.Module):
         x = self.output(x)
         return x
 
+class VanillaSequenceTokenEncoder(nn.Module):
+    """
+    ESM-style sequence encoder that maps amino acid tokens to latent space.
+    Output can be passed through the same quantizer as structure embeddings.
+    """
+    def __init__(self, vocab_size, d_model, n_heads, n_layers, d_out):
+        super().__init__()
+        self.d_out = d_out
+
+        # Token embedding
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+
+        # Transformer stack without geometric attention
+        self.transformer = VanillaTransformerStack(
+            d_model=d_model,
+            n_heads=n_heads,
+            v_heads=None,
+            n_layers=n_layers,
+            n_layers_geom=0,
+            scale_residue=True,
+        )
+
+        # Project to quantizer dimension
+        self.pre_vq_proj = nn.Linear(d_model, d_out)
+
+    def encode(
+        self,
+        seq_tokens: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        sequence_id: torch.Tensor | None = None,
+    ):
+        """
+        Args:
+            seq_tokens: [B, L] amino acid token indices
+            attention_mask: [B, L] boolean, True for valid positions
+            sequence_id: [B, L] optional sequence IDs
+
+        Returns:
+            z: [B, L, d_out] sequence embeddings ready for quantization
+        """
+        x = self.token_embedding(seq_tokens)
+
+        if sequence_id is None:
+            sequence_id = torch.zeros_like(seq_tokens, dtype=torch.int64)
+
+        x, _ = self.transformer.forward(
+            x=x,
+            attention_mask=attention_mask,
+            sequence_id=sequence_id,
+            affine=None,
+            affine_mask=None,
+            chain_id=None,
+        )
+
+        z = self.pre_vq_proj(x)
+
+        if attention_mask is not None:
+            z = z.masked_fill(~attention_mask.unsqueeze(2), 0)
+
+        return z
+
+
 class VanillaStructureTokenDecoder(nn.Module):
     """
     Reference: https://github.com/evolutionaryscale/esm/blob/2efdadfe77ddbb7f36459e44d158531b4407441f/esm/models/vqvae.py#L335
@@ -430,6 +495,7 @@ class VanillaStructureTokenDecoder(nn.Module):
         structure_tokens: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         sequence_id: torch.Tensor | None = None,
+        skip_pairwise: bool = False,
     ):
         if sequence_id is None:
             sequence_id = torch.zeros_like(structure_tokens, dtype=torch.int64)
@@ -451,25 +517,28 @@ class VanillaStructureTokenDecoder(nn.Module):
         ) # [B, L, 12], [B, L, 3, 3]
 
         pae, ptm = None, None
-        pairwise_logits = self.pairwise_classification_head(x) # [B, L, L, 64 + 96 + 64]
-        pairwise_dist_logits, pairwise_dir_logits, pae_logits = [
-            (o if o.numel() > 0 else None)
-            for o in pairwise_logits.split(self.pairwise_bins, dim=-1)
-        ] # [B, L, L, 64], [B, L, L, 96], [B, L, L, 64]
+        pairwise_dist_logits, pairwise_dir_logits = None, None
 
-        special_tokens_mask = structure_tokens >= min(self.special_tokens.values())
-        pae = compute_predicted_aligned_error(
-            pae_logits,  # type: ignore
-            aa_mask=~special_tokens_mask,
-            sequence_id=sequence_id,
-            max_bin=self.max_pae_bin,
-        ) # [B, L, L]
-        # This might be broken for chainbreak tokens? We might align to the chainbreak
-        ptm = compute_tm(
-            pae_logits,  # type: ignore
-            aa_mask=~special_tokens_mask,
-            max_bin=self.max_pae_bin,
-        ) # [B,]
+        if not skip_pairwise:
+            pairwise_logits = self.pairwise_classification_head(x) # [B, L, L, 64 + 96 + 64]
+            pairwise_dist_logits, pairwise_dir_logits, pae_logits = [
+                (o if o.numel() > 0 else None)
+                for o in pairwise_logits.split(self.pairwise_bins, dim=-1)
+            ] # [B, L, L, 64], [B, L, L, 96], [B, L, L, 64]
+
+            special_tokens_mask = structure_tokens >= min(self.special_tokens.values())
+            pae = compute_predicted_aligned_error(
+                pae_logits,  # type: ignore
+                aa_mask=~special_tokens_mask,
+                sequence_id=sequence_id,
+                max_bin=self.max_pae_bin,
+            ) # [B, L, L]
+            # This might be broken for chainbreak tokens? We might align to the chainbreak
+            ptm = compute_tm(
+                pae_logits,  # type: ignore
+                aa_mask=~special_tokens_mask,
+                max_bin=self.max_pae_bin,
+            ) # [B,]
 
         plddt_logits = self.plddt_head(x) # [B, L, 50]
         plddt_value = VanillaCategoricalMixture(
@@ -505,11 +574,46 @@ class VQVAEModel(nn.Module):
         self.decoder = VanillaStructureTokenDecoder(**model_cfg.decoder)
 
         self.inverse_folding_head = VanillaRegressionHead(
-            embed_dim=model_cfg.decoder.d_model, 
+            embed_dim=model_cfg.decoder.d_model,
             output_dim=len(C.SEQUENCE_VOCAB)
         )
 
         self._step_count = 0
+
+        # Initialize contrastive loss if configured
+        contrastive_cfg = model_cfg.get("contrastive", None)
+        self.use_contrastive = contrastive_cfg is not None and contrastive_cfg.get("enabled", False)
+
+        if self.use_contrastive:
+            self.contrastive_loss_weight = contrastive_cfg.get("loss_weight", 0.1)
+            self.annotation_loader = AnnotationLoader(contrastive_cfg["annotation_path"])
+            self.clip_loss = ProteinFunctionCLIPLoss(
+                structure_dim=model_cfg.encoder.d_out,
+                text_model_name=contrastive_cfg.get("text_model", "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract"),
+                shared_dim=contrastive_cfg.get("shared_dim", 512),
+                learnable_temperature=contrastive_cfg.get("learnable_temperature", True),
+                freeze_text_encoder=contrastive_cfg.get("freeze_text_encoder", True),
+            )
+
+        # Initialize forward folding if configured
+        forward_folding_cfg = model_cfg.get("forward_folding", None)
+        self.use_forward_folding = forward_folding_cfg is not None and forward_folding_cfg.get("enabled", False)
+
+        if self.use_forward_folding:
+            self.forward_folding_loss_weight = forward_folding_cfg.get("loss_weight", 1.0)
+            self.forward_folding_skip_binned = forward_folding_cfg.get("skip_binned_losses", False)
+            seq_enc_cfg = forward_folding_cfg.sequence_encoder
+
+            assert seq_enc_cfg.d_out == model_cfg.encoder.d_out, \
+                f"Sequence encoder d_out ({seq_enc_cfg.d_out}) must match structure encoder d_out ({model_cfg.encoder.d_out})"
+
+            self.sequence_encoder = VanillaSequenceTokenEncoder(
+                vocab_size=seq_enc_cfg.vocab_size,
+                d_model=seq_enc_cfg.d_model,
+                n_heads=seq_enc_cfg.n_heads,
+                n_layers=seq_enc_cfg.n_layers,
+                d_out=seq_enc_cfg.d_out,
+            )
 
     def forward(self, input_list, use_as_tokenizer=False):
         self._step_count += 1
@@ -539,7 +643,16 @@ class VQVAEModel(nn.Module):
         assert not z.isnan().any() and not quantized_indices.isnan().any()
         if use_as_tokenizer:
             return quantized_z, quantized_indices, z
-        decoded_states = self.decoder.decode(quantized_z, quantized_indices, attention_mask, sequence_id)
+
+        # Handle multi-codebook indices: MCQ returns [B, num_codebooks, L], standard returns [B, L]
+        # The decoder needs [B, L] for structure_tokens argument
+        if quantized_indices.dim() == 3:
+            # MCQ: use first codebook indices for decoder (shape purposes)
+            decoder_structure_tokens = quantized_indices[:, 0, :]
+        else:
+            decoder_structure_tokens = quantized_indices
+
+        decoded_states = self.decoder.decode(quantized_z, decoder_structure_tokens, attention_mask, sequence_id)
 
         # reconstructed proteins
         bb_pred = decoded_states["bb_pred"]
@@ -572,11 +685,97 @@ class VQVAEModel(nn.Module):
         inverse_folding_loss, inverse_folding_metrics = self.compute_inverse_folding(
             decoded_states["last_hidden_state"], seq_residue_tokens, attention_mask)
 
-        reconstruction_loss = (geom_dist_loss + geom_dir_loss + binned_dist_loss 
+        reconstruction_loss = (geom_dist_loss + geom_dir_loss + binned_dist_loss
                                 + binned_dir_loss + inverse_folding_loss).mean()
         loss = reconstruction_loss * self.loss_weight["reconstruction_loss_weight"] + partial_loss
-        
-        
+
+        # Contrastive loss for aligning structure with functional annotations
+        contrastive_metrics = {}
+        if self.use_contrastive:
+            # Extract chain IDs from pdb_chain objects (format: "pdbid_chainid")
+            chain_ids = [f"{pc.id}_{pc.chain_id}" for pc in pdb_chain]
+
+            # Get function texts and annotation mask
+            texts, ann_mask = self.annotation_loader.get_batch_annotations(chain_ids)
+            ann_mask = ann_mask.to(coords.device)
+
+            # Compute contrastive loss on encoder output z
+            contrastive_loss, contrastive_metrics = self.clip_loss(
+                z, attention_mask, texts, ann_mask
+            )
+            loss = loss + self.contrastive_loss_weight * contrastive_loss
+
+        # Forward folding path (if enabled)
+        forward_folding_metrics = {}
+        forward_folding_loss = torch.tensor(0.0, device=coords.device)
+
+        if self.use_forward_folding:
+            # Encode sequence
+            z_seq = self.sequence_encoder.encode(seq_residue_tokens, attention_mask, sequence_id)
+
+            # Quantize through SAME codebooks
+            quantized_z_seq, quantized_indices_seq, partial_loss_seq, partial_metrics_seq = self.quantizer(z_seq)
+
+            # Get decoder structure tokens
+            if quantized_indices_seq.dim() == 3:
+                decoder_structure_tokens_seq = quantized_indices_seq[:, 0, :]
+            else:
+                decoder_structure_tokens_seq = quantized_indices_seq
+
+            # Decode sequence embeddings to predict structure
+            # Skip pairwise head if binned losses are skipped to save memory
+            decoded_states_seq = self.decoder.decode(
+                quantized_z_seq, decoder_structure_tokens_seq, attention_mask, sequence_id,
+                skip_pairwise=self.forward_folding_skip_binned
+            )
+
+            # Compute forward folding losses
+            coords_pred_from_seq = decoded_states_seq["bb_pred"]
+
+            ff_geom_dist_loss, ff_geom_dist_metrics = self.compute_geometric_distance(
+                coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone()
+            )
+            ff_geom_dir_loss, ff_geom_dir_metrics = self.compute_geometric_direction(
+                coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone()
+            )
+
+            # Optionally skip binned losses to save memory
+            if self.forward_folding_skip_binned:
+                ff_binned_dist_loss = torch.tensor(0.0, device=coords.device)
+                ff_binned_dir_loss = torch.tensor(0.0, device=coords.device)
+                ff_binned_dist_metrics = {}
+                ff_binned_dir_metrics = {}
+            else:
+                ff_binned_dist_loss, ff_binned_dist_metrics = self.compute_binned_distance(
+                    decoded_states_seq["pairwise_dist_logits"], coords.clone(), attention_mask.clone()
+                )
+                ff_binned_dir_loss, ff_binned_dir_metrics = self.compute_binned_direction(
+                    decoded_states_seq["pairwise_dir_logits"], coords[:, :, :3, :].clone(), attention_mask.clone()
+                )
+
+            # Combine forward folding losses
+            forward_folding_loss = (
+                ff_geom_dist_loss + ff_geom_dir_loss + ff_binned_dist_loss + ff_binned_dir_loss
+            ).mean()
+
+            # Add quantization losses from sequence path
+            forward_folding_loss = forward_folding_loss + partial_loss_seq
+
+            # Prefix all metrics with ff_
+            forward_folding_metrics = {
+                f"ff_{k}": v for k, v in {
+                    **ff_geom_dist_metrics,
+                    **ff_geom_dir_metrics,
+                    **ff_binned_dist_metrics,
+                    **ff_binned_dir_metrics,
+                }.items()
+            }
+            forward_folding_metrics.update({f"ff_seq_{k}": v for k, v in partial_metrics_seq.items()})
+            forward_folding_metrics["forward_folding_loss"] = forward_folding_loss
+
+            # Add forward folding to total loss
+            loss = loss + self.forward_folding_loss_weight * forward_folding_loss
+
         metrics = {
             **geom_dist_metrics,
             **geom_dir_metrics,
@@ -584,6 +783,8 @@ class VQVAEModel(nn.Module):
             **binned_dir_metrics,
             **inverse_folding_metrics,
             **partial_metrics,
+            **contrastive_metrics,
+            **forward_folding_metrics,
             "reconstruction_loss": reconstruction_loss,
             "bb_rmsd": torch.tensor(bb_rmsd_list, device=coords.device).mean(),
             "lddt": torch.tensor(lddt_list, device=coords.device).mean(),

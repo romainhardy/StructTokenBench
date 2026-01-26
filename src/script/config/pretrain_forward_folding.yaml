@@ -1,0 +1,15 @@
+defaults:
+  - pretrain
+
+model:
+    forward_folding:
+        enabled: true
+        loss_weight: 1.0
+        sequence_encoder:
+            vocab_size: 33
+            d_model: 512
+            n_heads: 8
+            n_layers: 4
+            d_out: 128
+
+experiment_name: vqvae_forward_folding

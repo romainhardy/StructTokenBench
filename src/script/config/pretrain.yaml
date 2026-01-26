@@ -10,16 +10,22 @@ model:
     pretrained_ckpt_path: "" # where to load the pretrained pLM
     ckpt_path: null
     quantizer:
-        quantizer_type: StraightThroughQuantizer
+        quantizer_type: StraightThroughQuantizer  # or MCQQuantizer
         loss_weight:
             commitment_loss_weight: 0.25
             quantization_loss_weight: 1.0
             reconstruction_loss_weight: 1.0
+            entropy_loss_weight: 0.0  # MCQ only: weight for entropy loss
         codebook_size: 512
         codebook_embed_size: 1024
         _need_init: true
         freeze_codebook: false
         use_linear_project: false
+        # MCQ-specific parameters (only used when quantizer_type=MCQQuantizer)
+        num_codebooks: 8            # Number of sub-codebooks
+        use_entropy_loss: false     # Enable entropy loss for better codebook utilization
+        entropy_temp: 0.01          # Temperature for entropy loss computation
+        normalize_embeddings: true  # L2-normalize embeddings (cosine similarity vs L2)
     encoder:
         d_model: 1024
         n_heads: 1
@@ -30,6 +36,16 @@ model:
         d_model: 1024
         n_heads: 16
         n_layers: 8
+    forward_folding:
+        enabled: false  # Set to true to enable
+        loss_weight: 1.0  # Weight for forward folding loss
+        skip_binned_losses: false  # Skip binned dist/dir losses to save memory
+        sequence_encoder:
+            vocab_size: 33  # ESM3 sequence vocabulary size
+            d_model: 512    # Transformer hidden dimension
+            n_heads: 8      # Number of attention heads
+            n_layers: 4     # Number of transformer layers
+            d_out: 128      # Must match encoder.d_out
 deepspeed_path: src/script/config/deepspeed/32_stage2.json
 default_data_dir: null
 tokenizer: null
