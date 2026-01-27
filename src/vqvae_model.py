@@ -1,6 +1,5 @@
 import os
 import math
-import time
 import json
 import hydra
 import numpy as np
@@ -17,8 +16,6 @@ from transformers import AutoConfig, EsmModel
 from torch.optim import Adam, AdamW
 import torch.nn.functional as F
 import deepspeed
-from pytorch_lightning.utilities import grad_norm
-
 
 from esm.layers.structure_proj import Dim6RotStructureHead
 from esm.utils.constants import esm3 as C
@@ -1387,16 +1384,12 @@ class LightningVQPretrainModel(pl.LightningModule):
         self.trainer.strategy.config["train_micro_batch_size_per_gpu"] = self.optimizer_cfg.micro_batch_size
         self.model = model_init_fn(self.trainer, self.model_cfg)
 
-        # get time here for first iteration at batch 0
-        # logged in on_train_batch_end
-        self._last_logged_batch_start_time = time.monotonic()
-
     def training_step(self, batch, batch_idx):
         outputs = self.model(batch["input_list"])
         loss, metrics = outputs[0]
 
         self.log(
-            "training_loss_step", loss, on_step=True, on_epoch=False, prog_bar=True,
+            "train/loss", loss, on_step=True, on_epoch=False, prog_bar=True,
             batch_size=self.optimizer_cfg.micro_batch_size, logger=True, sync_dist=True,
         )
 
@@ -1423,40 +1416,21 @@ class LightningVQPretrainModel(pl.LightningModule):
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """
-        Log time/step and TFLOPS
-        Args:
-            outputs: outputs of train_step, not used, required for hook
-            batch: use batch to get input/output sequence length for TFLOPs
-            batch_idx: batch number, not used required for hook
+        Clean up GPU memory after each batch.
         """
-
-        if batch_idx > 0 and batch_idx % self.trainer.log_every_n_steps == 0:
-            # get the time for this iteration
-            elapsed_time = time.monotonic() - self._last_logged_batch_start_time
-            # start timeer for the next iteration
-            self._last_logged_batch_start_time = time.monotonic()
-            time_per_step = elapsed_time / self.trainer.log_every_n_steps
-
-            # useful to log this even though PTL provides it in the progressbar
-            # PTL logs provide exponential decaying average which is not useful
-            # forquick benchmarking, especially for large models
-            self.log(
-                "sec/step", time_per_step, on_step=True, prog_bar=True, 
-                logger=True, rank_zero_only=True,
-            )
-        
         torch.cuda.empty_cache()
 
     def _valid_or_test_step(self, batch, batch_idx, split="validation"):
         outputs = self.model(batch["input_list"])
         loss, metrics = outputs[0]
 
+        # Use slash-based naming: val/loss, val/reconstruction_loss, etc.
         log_metrics = {
-            f"{split}_{k}": v for k, v in metrics.items()
+            f"{split}/{k}": v for k, v in metrics.items()
         }
 
         self.log_dict(
-            {f"{split}_loss": loss, **log_metrics},
+            {f"{split}/loss": loss, **log_metrics},
             prog_bar=True,
             batch_size=self.optimizer_cfg.micro_batch_size,
             logger=True,
@@ -1464,7 +1438,7 @@ class LightningVQPretrainModel(pl.LightningModule):
         )
 
         return {
-            f"{split}_loss": loss,
+            f"{split}/loss": loss,
             **log_metrics,
         }
 
@@ -1484,15 +1458,35 @@ class LightningVQPretrainModel(pl.LightningModule):
         ]
 
     def _valid_or_test_epoch_end(self, outputs, split="validation"):
-        
+
         agg_result = {k: [] for k in outputs[0].keys() if k.startswith(split)}
         for out in outputs:
             for k in out.keys():
                 if k.startswith(split):
                     agg_result[k].append(out[k])
 
+        # Get device from first tensor metric
+        device = None
         for k in agg_result.keys():
-            agg_result[k] = torch.stack(agg_result[k]).mean()
+            for v in agg_result[k]:
+                if isinstance(v, torch.Tensor):
+                    device = v.device
+                    break
+            if device is not None:
+                break
+
+        for k in agg_result.keys():
+            # Convert floats/ints to tensors and ensure all on same device
+            tensors = []
+            for v in agg_result[k]:
+                if isinstance(v, torch.Tensor):
+                    t = v.float()
+                else:
+                    t = torch.tensor(v, dtype=torch.float32)
+                if device is not None:
+                    t = t.to(device)
+                tensors.append(t)
+            agg_result[k] = torch.stack(tensors).mean()
 
         self.log_dict(
             agg_result, on_step=False, on_epoch=True, prog_bar=True,
@@ -1507,17 +1501,10 @@ class LightningVQPretrainModel(pl.LightningModule):
             getattr(self, f"{split}_step_outputs").clear()
 
     def on_before_optimizer_step(self, optimizer):
-        for n,p in self.model.named_parameters():
+        # Gather gradients for DeepSpeed
+        for n, p in self.model.named_parameters():
             grad_data = deepspeed.utils.safe_get_full_grad(p)
             p.grad = grad_data
-        norms = grad_norm(self.model, norm_type=2)
-        norms = {k:v.to(grad_data.device) for k,v in norms.items()}
-        
-        self.log_dict(
-            norms, prog_bar=True, sync_dist=True,  # reduce metrics across devices
-            batch_size=self.optimizer_cfg.micro_batch_size, add_dataloader_idx=False,
-            #on_step=True, #on_epoch=True,
-        )
 
     def configure_optimizers(self):
         # hyperparameter logging needs to occur after ddp launch

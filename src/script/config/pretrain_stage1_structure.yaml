@@ -12,18 +12,38 @@
 
 defaults:
     - pretrain
+    - override /lightning/logger: wandb
 
 model:
     training_stage: 1
     resume_from_stage: null
 
     # Use MCQ quantizer for better codebook utilization
-    # codebook_embed_size must match encoder.d_out
+    # Settings match original MCQ + CLIP config
     quantizer:
         quantizer_type: MCQQuantizer
+        codebook_size: 512
         codebook_embed_size: 128  # Must match encoder.d_out
         num_codebooks: 8
         normalize_embeddings: true
+        # Entropy loss (disabled - can over-constrain natural frequency patterns)
+        use_entropy_loss: false
+        entropy_temp: 0.01
+        # Orthogonality regularization (GCP-VQVAE): encourages well-separated codebook entries
+        use_orthogonality_loss: true
+        loss_weight:
+            entropy_loss_weight: 0.1
+            orthogonality_loss_weight: 0.1  # Weight for orthogonality regularization
+
+    # CLIP-style contrastive learning (matches original MCQ + CLIP config)
+    contrastive:
+        enabled: true
+        loss_weight: 0.1
+        annotation_path: /lambda/nfs/rhardy-us-east-1/code/protein/data/annotations/training_chain_annotations.json
+        text_model: microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract
+        shared_dim: 512
+        learnable_temperature: true
+        freeze_text_encoder: true
 
     # Stage 1: No forward folding, sequence decoder, or alignment
     forward_folding:
@@ -41,3 +61,17 @@ model:
 # Stage 1 specific settings
 experiment_name: stage1_structure
 run_name: stage1_structure_run
+
+# Skip test data loading (CASP14, CAMEO) during pretraining
+data:
+    skip_test_data: true
+
+# Disable LR monitor logging (only log losses/metrics)
+# Override checkpoint to monitor validation/loss instead of validation_f1_score
+lightning:
+    callbacks:
+        lr_monitor: null
+        checkpoint:
+            monitor: "validation/loss"
+            mode: "min"
+            filename: "{epoch}-{step}-{validation/loss:.2f}"

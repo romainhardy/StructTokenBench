@@ -331,23 +331,42 @@ class WrappedOurPretrainedTokenizer():
         for k,v in model_states.items():
             assert k.startswith("model.")
             new_model_states[k[6:]] = v
-        self.model.load_state_dict(new_model_states)
+        # Use strict=False to handle checkpoints with extra keys (e.g., clip_loss, vocab_usage)
+        self.model.load_state_dict(new_model_states, strict=False)
         for p in self.model.parameters():
             p.requires_grad = False
         self.model = self.model.to(self.device)
-        
+
         self.seq_tokenizer = EsmSequenceTokenizer()
 
         self.ckpt_name = ckpt_name
 
+        # Check if using MCQ (multiple codebooks) or simple VQ (single codebook)
+        self.is_mcq = hasattr(self.model.quantizer, 'codebooks')
+
         # reference: https://github.com/evolutionaryscale/esm/blob/39a3a6cb1e722347947dc375e3f8e2ba80ed8b59/esm/utils/constants/esm3.py#L18C12-L18C35
-        self.pad_token_id = self.model.quantizer.codebook.weight.shape[0] + 3
+        self.pad_token_id = self._get_codebook_size() + 3
+
+    def _get_codebook_size(self):
+        """Get the total codebook size (handles both MCQ and simple VQ)."""
+        if self.is_mcq:
+            # MCQ: total size = num_codebooks * sub_codebook_size
+            return self.model.quantizer.codebook_size
+        else:
+            return self.model.quantizer.codebook.weight.shape[0]
 
     def get_num_tokens(self):
-        return self.model.quantizer.codebook.weight.shape[0] + 5
-    
+        return self._get_codebook_size() + 5
+
     def get_codebook_embedding(self,):
-        return self.model.quantizer.codebook.weight
+        if self.is_mcq:
+            # MCQ: concatenate embeddings from all sub-codebooks
+            embeddings = []
+            for cb in self.model.quantizer.codebooks:
+                embeddings.append(cb.weight)
+            return torch.cat(embeddings, dim=0)
+        else:
+            return self.model.quantizer.codebook.weight
     
     def encode_structure(self, pdb_chain, use_continuous=False, use_sequence=False):
         assert use_sequence

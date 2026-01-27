@@ -79,9 +79,16 @@ def main(cfg):
         tmp_cfg.encoder.d_model = cfg.model_encoder_dmodel
         tmp_cfg.encoder.n_layers = cfg.model_encoder_nlayers
         tmp_cfg.encoder.v_heads = cfg.model_encoder_vheads
-        tmp_cfg.quantizer.codebook_size = cfg.quantizer_codebook_size 
+        tmp_cfg.quantizer.codebook_size = cfg.quantizer_codebook_size
         tmp_cfg.quantizer.codebook_embed_size = cfg.quantizer_codebook_embed_size
         tmp_cfg.encoder.d_out = cfg.model_encoder_dout
+        # Handle MCQ quantizer settings
+        if hasattr(cfg, 'quantizer_type'):
+            tmp_cfg.quantizer.quantizer_type = cfg.quantizer_type
+        if hasattr(cfg, 'quantizer_num_codebooks'):
+            tmp_cfg.quantizer.num_codebooks = cfg.quantizer_num_codebooks
+        if hasattr(cfg, 'quantizer_normalize_embeddings'):
+            tmp_cfg.quantizer.normalize_embeddings = cfg.quantizer_normalize_embeddings
 
         pretrained_model_cfg = {
             "model_cfg": tmp_cfg,
@@ -107,6 +114,12 @@ def main(cfg):
     if not cfg.data.use_continuous:
         # num_tokens is needed only when using single MLP classifier w/ LMs
         cfg.model.num_tokens = datamodule.get_tokenizer().get_num_tokens()
+        # d_model is the codebook embedding dimension
+        codebook_embed = datamodule.get_codebook_embedding()
+        cfg.model.d_model = codebook_embed.shape[1]
+    else:
+        # For continuous mode, d_model is the encoder output dimension (codebook_embed_size)
+        cfg.model.d_model = cfg.quantizer_codebook_embed_size
     cfg.model.use_sequence = cfg.data.use_sequence
 
     # set up module module

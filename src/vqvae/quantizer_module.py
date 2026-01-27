@@ -181,6 +181,7 @@ class MCQQuantizer(nn.Module):
         num_codebooks: int = 8,
         use_entropy_loss: bool = False,
         entropy_temp: float = 0.01,
+        use_orthogonality_loss: bool = False,  # GCP-VQVAE orthogonality regularization
         normalize_embeddings: bool = True,
         _need_init: bool = True,
         freeze_codebook: bool = False,
@@ -207,6 +208,7 @@ class MCQQuantizer(nn.Module):
 
         self.use_entropy_loss = use_entropy_loss
         self.entropy_temp = entropy_temp
+        self.use_orthogonality_loss = use_orthogonality_loss
         self.normalize_embeddings = normalize_embeddings
 
         self._need_init = _need_init
@@ -384,6 +386,7 @@ class MCQQuantizer(nn.Module):
 
         all_quantized = []
         all_indices = []
+        all_soft_probs = []  # For entropy loss computation
         total_commitment_loss = 0.0
         total_quantization_loss = 0.0
         total_vocab_usage = 0.0
@@ -413,6 +416,7 @@ class MCQQuantizer(nn.Module):
                         + codebook_weight.square().sum(dim=1)
                         - 2 * flat_chunk_norm @ codebook_weight.T
                     )
+                    similarity = -dist_sq  # Convert distance to similarity
                     indices = torch.argmin(dist_sq, dim=1)
 
                 quantized = F.embedding(indices, codebook_weight)
@@ -423,6 +427,11 @@ class MCQQuantizer(nn.Module):
                 total_commitment_loss += commitment_loss
                 total_quantization_loss += quantization_loss
                 num_active_codebooks += 1
+
+                # Compute soft assignment probabilities for entropy loss
+                if self.use_entropy_loss:
+                    soft_probs = F.softmax(similarity / self.entropy_temp, dim=-1)  # [B*L, sub_codebook_size]
+                    all_soft_probs.append(soft_probs)
 
                 # Straight-through estimator
                 quantized = flat_chunk_norm + (quantized - flat_chunk_norm).detach()
@@ -472,11 +481,59 @@ class MCQQuantizer(nn.Module):
             + self.loss_weight["quantization_loss_weight"] * avg_quantization_loss
         )
 
+        # Compute entropy loss to encourage uniform codebook utilization
+        entropy_loss = torch.tensor(0.0, device=z.device)
+        avg_entropy = torch.tensor(0.0, device=z.device)
+        if self.use_entropy_loss and len(all_soft_probs) > 0:
+            # Stack soft probs: [num_active_codebooks, B*L, sub_codebook_size]
+            stacked_probs = torch.stack(all_soft_probs, dim=0)
+            # Average across all tokens to get usage distribution per codebook
+            # [num_active_codebooks, sub_codebook_size]
+            avg_probs = stacked_probs.mean(dim=1)
+            # Compute entropy for each codebook: H = -sum(p * log(p))
+            # Higher entropy = more uniform distribution (better)
+            eps = 1e-8
+            entropy_per_codebook = -torch.sum(avg_probs * torch.log(avg_probs + eps), dim=-1)
+            avg_entropy = entropy_per_codebook.mean()
+            # Maximum possible entropy for uniform distribution
+            max_entropy = torch.log(torch.tensor(self.sub_codebook_size, dtype=torch.float, device=z.device))
+            # Normalize entropy to [0, 1] range and compute loss as (1 - normalized_entropy)
+            # This encourages maximizing entropy (uniform usage)
+            normalized_entropy = avg_entropy / max_entropy
+            entropy_loss = 1.0 - normalized_entropy
+            # Add weighted entropy loss
+            loss = loss + self.loss_weight.get("entropy_loss_weight", 0.1) * entropy_loss
+
+        # Compute orthogonality regularization loss (GCP-VQVAE Equation 7)
+        # L_orth = ||E^T E - I_K||_F^2
+        # This encourages codebook entries to be orthogonal (well-separated on hypersphere)
+        orthogonality_loss = torch.tensor(0.0, device=z.device)
+        if self.use_orthogonality_loss:
+            total_orth_loss = 0.0
+            for i in active_codebooks:
+                # Get normalized codebook weights: [sub_codebook_size, sub_embed_size]
+                E = self._get_normalized_codebook(i)  # [K, D] where K=64, D=16
+                # Compute E^T E (Gram matrix): [K, K]
+                gram = E @ E.T  # [64, 64]
+                # Identity matrix
+                I_K = torch.eye(self.sub_codebook_size, device=z.device, dtype=gram.dtype)
+                # Frobenius norm squared: ||E^T E - I_K||_F^2
+                orth_loss = torch.sum((gram - I_K) ** 2)
+                total_orth_loss += orth_loss
+            # Average across active codebooks
+            if len(active_codebooks) > 0:
+                orthogonality_loss = total_orth_loss / len(active_codebooks)
+            # Add weighted orthogonality loss
+            loss = loss + self.loss_weight.get("orthogonality_loss_weight", 0.1) * orthogonality_loss
+
         metrics = {
             "commitment_loss": avg_commitment_loss,
             "quantization_loss": avg_quantization_loss,
             "vocab_usage": total_vocab_usage / self.num_codebooks,
             "active_codebooks": num_active_codebooks,
+            "entropy_loss": entropy_loss,
+            "codebook_entropy": avg_entropy,
+            "orthogonality_loss": orthogonality_loss,
         }
 
         return quantized_z, quantized_indices, loss, metrics

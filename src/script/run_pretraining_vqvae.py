@@ -41,6 +41,8 @@ def setup_trainer(cfg):
         hydra.utils.instantiate(cfg.lightning.callbacks.lr_monitor),
         hydra.utils.instantiate(cfg.lightning.callbacks.progress_bar),
     ]
+    # Filter out None callbacks (e.g., when lr_monitor is disabled via null)
+    callbacks = [c for c in callbacks if c is not None]
     trainer = pl.Trainer(
         **cfg.trainer,
         callbacks=callbacks,
@@ -83,6 +85,7 @@ def main(cfg):
         data_args=cfg.data,
         py_logger=logger,
         test_only=getattr(cfg, "test_only", False),
+        skip_test_data=getattr(cfg.data, "skip_test_data", False),
     )
     datamodule.setup()
 

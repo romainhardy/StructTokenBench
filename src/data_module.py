@@ -22,9 +22,10 @@ def get_tokenizer_device(tokenizer_device) -> torch.device:
 
 class ProteinDataModule(pl.LightningDataModule):
 
-    def __init__(self, tokenizer_name: str, tokenizer_device: str, seed: int, 
-        micro_batch_size: int, data_args, py_logger, test_only: bool, 
+    def __init__(self, tokenizer_name: str, tokenizer_device: str, seed: int,
+        micro_batch_size: int, data_args, py_logger, test_only: bool,
         precompute_tokens: bool, tokenizer_kwargs: dict,
+        skip_test_data: bool = False,
     ):
         super().__init__()
 
@@ -37,12 +38,14 @@ class ProteinDataModule(pl.LightningDataModule):
         self.py_logger = py_logger
         self.test_only = test_only
         self.precompute_tokens = precompute_tokens
+        self.skip_test_data = skip_test_data
 
         if self.test_only:
             self.all_split_names = []
         else:
             self.all_split_names = ["validation"]
-        self.all_split_names += eval(self.data_args.data_name).SPLIT_NAME["test"]
+        if not self.skip_test_data:
+            self.all_split_names += eval(self.data_args.data_name).SPLIT_NAME["test"]
         # to store device: tokenizer map to prevent multiple tokenizers on the same device
         self.device_tokenizer_map = {} 
 
@@ -156,8 +159,9 @@ class ProteinDataModule(pl.LightningDataModule):
 
 class PretrainingDataModule(pl.LightningDataModule):
 
-    def __init__(self, device: str, seed: int, 
+    def __init__(self, device: str, seed: int,
         micro_batch_size: int, data_args, py_logger, test_only,
+        skip_test_data: bool = False,
     ):
         super().__init__()
 
@@ -167,11 +171,13 @@ class PretrainingDataModule(pl.LightningDataModule):
         self.data_args = data_args
         self.py_logger = py_logger
         self.test_only = test_only
+        self.skip_test_data = skip_test_data
 
         self.all_split_names = []
         if not self.test_only:
             self.all_split_names += ["validation"]
-        self.all_split_names += eval(self.data_args.data_name).SPLIT_NAME["test"]
+        if not self.skip_test_data:
+            self.all_split_names += eval(self.data_args.data_name).SPLIT_NAME["test"]
 
         # to store device: tokenizer map to prevent multiple tokenizers on the same device
         self.device_tokenizer_map = {}

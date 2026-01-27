@@ -417,7 +417,9 @@ class PlModel(pl.LightningModule):
                     behavior only used for inheritance
         """
 
-        self.trainer.strategy.config["train_micro_batch_size_per_gpu"] = self.optimizer_cfg.micro_batch_size
+        # DeepSpeed requires batch size in config; DDP doesn't have this attribute
+        if hasattr(self.trainer.strategy, 'config') and self.trainer.strategy.config is not None:
+            self.trainer.strategy.config["train_micro_batch_size_per_gpu"] = self.optimizer_cfg.micro_batch_size
         self.model = model_init_fn(self.trainer, self.model_cfg, 
                         codebook_embedding=self.codebook_embedding)
         
