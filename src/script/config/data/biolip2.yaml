@@ -2,7 +2,7 @@ num_workers: 0
 prefetch_factor: null
 data_path: ${..default_data_dir}/data/functional/local/
 data_name: BioLIP2FunctionDataset
-target_field: null
+target_field: binding_label  # Valid options: binding_label, catalytic_label
 filter_length: 600
 truncation_length: 5000
 multi_label: false

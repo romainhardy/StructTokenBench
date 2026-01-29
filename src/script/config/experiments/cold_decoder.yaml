@@ -1,0 +1,11 @@
+# Experiment: Train decoder from scratch
+# Decoder randomly initialized instead of warm-started
+defaults:
+    - _self_
+    - ../finetune_mcq
+
+model:
+    warm_start_decoder: false
+
+experiment_name: mcq_finetune_cold_decoder
+run_name: cold_decoder_v1

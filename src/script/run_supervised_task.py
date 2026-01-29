@@ -20,6 +20,7 @@ sys.path.append(exc_dir_baseline)
 
 import data_module
 from util import setup_loggings
+from eval_utils import save_experiment_results, extract_metrics_from_trainer
 
 def setup_trainer(cfg):
     trainer_logger = hydra.utils.instantiate(cfg.lightning.logger)
@@ -79,9 +80,22 @@ def main(cfg):
         tmp_cfg.encoder.d_model = cfg.model_encoder_dmodel
         tmp_cfg.encoder.n_layers = cfg.model_encoder_nlayers
         tmp_cfg.encoder.v_heads = cfg.model_encoder_vheads
-        tmp_cfg.quantizer.codebook_size = cfg.quantizer_codebook_size 
+        tmp_cfg.quantizer.codebook_size = cfg.quantizer_codebook_size
         tmp_cfg.quantizer.codebook_embed_size = cfg.quantizer_codebook_embed_size
         tmp_cfg.encoder.d_out = cfg.model_encoder_dout
+
+        pretrained_model_cfg = {
+            "model_cfg": tmp_cfg,
+            "pretrained_ckpt_path": cfg.tokenizer_pretrained_ckpt_path,
+            "ckpt_name": cfg.tokenizer_ckpt_name,
+        }
+    elif cfg.tokenizer == "WrappedMCQTokenizer":
+        assert cfg.tokenizer_pretrained_ckpt_path is not None
+        assert cfg.tokenizer_ckpt_name is not None
+        # Load MCQ config from finetune_mcq.yaml
+        tmp_cfg = omegaconf.OmegaConf.load(os.path.join(exc_dir, "./script/config/finetune_mcq.yaml"))["model"]
+        tmp_cfg.quantizer.freeze_codebook = True
+        tmp_cfg.quantizer._need_init = False
 
         pretrained_model_cfg = {
             "model_cfg": tmp_cfg,
@@ -107,6 +121,14 @@ def main(cfg):
     if not cfg.data.use_continuous:
         # num_tokens is needed only when using single MLP classifier w/ LMs
         cfg.model.num_tokens = datamodule.get_tokenizer().get_num_tokens()
+        # For multi-codebook tokenizers (MCQ), pass num_codebooks to model
+        tokenizer = datamodule.get_tokenizer()
+        if hasattr(tokenizer, 'get_num_codebooks'):
+            # Allow adding new keys to the config
+            omegaconf.OmegaConf.set_struct(cfg.model, False)
+            cfg.model.num_codebooks = tokenizer.get_num_codebooks()
+            cfg.model.d_model = tokenizer.get_sub_embed_size()  # d_model is sub_embed_size for MCQ
+            omegaconf.OmegaConf.set_struct(cfg.model, True)
     cfg.model.use_sequence = cfg.data.use_sequence
 
     # set up module module
@@ -122,10 +144,11 @@ def main(cfg):
     )
 
     # training pipeline
-    
+    best_ckpt_path = None
+
     if not getattr(cfg, "validate_only", False) and not getattr(cfg, "test_only", False):
         logger.info("*********** start training ***********\n\n")
-        
+
         trainer.fit(
             model=model, datamodule=datamodule,
             ckpt_path=cfg.model.ckpt_path
@@ -137,17 +160,84 @@ def main(cfg):
         logger.info("Finished saving final model")
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
-        
+
+        # Get best checkpoint path
+        best_ckpt_path = trainer.checkpoint_callback.best_model_path
+
+        # Validate on best checkpoint (includes both validation and test splits)
+        logger.info("*********** start evaluation ***********\n\n")
         trainer.validate(
             model=model, datamodule=datamodule,
             ckpt_path="best",
         )
+        # Extract validation and test metrics (test metrics have "test" in the key name)
+        validation_metrics = extract_metrics_from_trainer(trainer, "validation")
+        test_metrics = extract_metrics_from_trainer(trainer, "test")
+
     else:
         logger.info("*********** start validation ***********\n\n")
         trainer.validate(
             model=model, datamodule=datamodule,
             ckpt_path=cfg.model.ckpt_path
         )
+        # Extract validation and test metrics (test metrics have "test" in the key name)
+        validation_metrics = extract_metrics_from_trainer(trainer, "validation")
+        test_metrics = extract_metrics_from_trainer(trainer, "test")
+
+    # Save structured results to JSON
+    results_dir = getattr(cfg, "results_dir", os.path.join(cfg.trainer.default_root_dir, "results"))
+
+    # Gather tokenizer info
+    tokenizer = datamodule.get_tokenizer()
+    tokenizer_info = {
+        "name": getattr(cfg, "tokenizer_ckpt_name", cfg.tokenizer),
+        "class": cfg.tokenizer,
+        "checkpoint": getattr(cfg, "tokenizer_pretrained_ckpt_path", None),
+        "num_tokens": cfg.model.num_tokens if hasattr(cfg.model, "num_tokens") else None,
+        "d_model": cfg.model.d_model if hasattr(cfg.model, "d_model") else None,
+    }
+
+    # Gather dataset info
+    dataset_info = {
+        "name": cfg.data.data_name,
+        "data_path": cfg.data.data_path,
+        "target_field": getattr(cfg.data, "target_field", None),
+        "filter_length": getattr(cfg.data, "filter_length", None),
+        "use_continuous": cfg.data.use_continuous,
+    }
+
+    # Gather hyperparameters
+    hyperparameters = {
+        "lr": cfg.optimization.optimizer.lr,
+        "batch_size": cfg.optimization.micro_batch_size,
+        "max_steps": cfg.max_steps,
+        "seed": cfg.optimization.seed,
+        "num_layer": cfg.model.num_layer,
+        "hidden_size": cfg.model.hidden_size,
+        "dropout": cfg.model.dropout,
+    }
+
+    # Build description
+    description = f"{cfg.data.data_name} evaluation with {tokenizer_info['name']} tokenizer"
+    if cfg.data.use_continuous:
+        description += " (continuous mode)"
+    else:
+        description += " (discrete mode)"
+
+    # Save results
+    results_path = save_experiment_results(
+        experiment_name=cfg.experiment_name,
+        description=description,
+        config=omegaconf.OmegaConf.to_container(cfg, resolve=True),
+        tokenizer_info=tokenizer_info,
+        dataset_info=dataset_info,
+        hyperparameters=hyperparameters,
+        validation_metrics=validation_metrics,
+        test_metrics=test_metrics,
+        best_checkpoint_path=best_ckpt_path,
+        output_dir=results_dir,
+    )
+    logger.info(f"Saved experiment results to: {results_path}")
 
 if __name__ == "__main__":
     main()

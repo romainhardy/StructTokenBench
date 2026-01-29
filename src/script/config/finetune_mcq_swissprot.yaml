@@ -1,0 +1,32 @@
+# Fine-tuning config for MCQ with Swiss-Prot AlphaFold structures
+# Uses 550k high-quality predicted structures from AlphaFold Swiss-Prot
+
+defaults:
+    - finetune_mcq  # Inherit MCQ fine-tuning config
+    - _self_
+
+# Use Swiss-Prot AlphaFold structures
+data:
+    data_version: alphafold_swissprot  # 550,122 samples
+    pdb_data_dir: /home/romainlhardy/data/protein  # Parent dir containing alphafold_swissprot/
+
+# Enable pLDDT-weighted loss (AlphaFold structures have per-residue confidence)
+model:
+    use_plddt_weighting: true
+
+# Training settings for larger dataset
+max_steps: 50000  # More steps for larger dataset
+
+trainer:
+    default_root_dir: /home/romainlhardy/code/protein/logs/mcq_finetune_swissprot
+    limit_train_batches: null
+    limit_val_batches: null
+
+experiment_name: mcq_finetune_swissprot
+run_name: mcq_finetune_swissprot_v1
+
+# Optimization settings for longer training
+optimization:
+    scheduler:
+        num_warmup_steps: 1000  # Increased warmup for 50k steps
+        num_training_steps: 50000

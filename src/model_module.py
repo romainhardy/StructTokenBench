@@ -61,17 +61,38 @@ class ProceedingBaseModel(nn.Module):
 
         input_ids, input_mask, seqs = input_list
 
+        # Check for multi-codebook case: input_ids has shape [B, num_codebooks, L]
+        is_multi_codebook = input_ids.dim() == 3 and hasattr(self, 'num_codebooks') and self.num_codebooks is not None
+
+        if is_multi_codebook:
+            # Multi-codebook (MCQ): input_ids is [B, num_codebooks, L]
+            seq_length = input_ids.shape[2]
+        else:
+            # Standard case: input_ids is [B, L] or [B, L, hidden_dim]
+            seq_length = input_ids.shape[1]
+
         # add positional embedding
-        seq_length = input_ids.shape[1]
-        position_ids = self.position_ids[:,  :seq_length]
+        position_ids = self.position_ids[:, :seq_length]
         position_embeddings = self.position_embed(position_ids)
 
         if self.add_noise is None:
             if not self.sequence_only:
                 if not hasattr(self, "tokens_embed"):
                     feature = input_ids
+                elif is_multi_codebook:
+                    # Multi-codebook: look up each codebook and concatenate
+                    # input_ids: [B, num_codebooks, L], each value in [0, 511] with offsets
+                    # tokens_embed: [512 + special, sub_embed_size] = [517, 16]
+                    # Output: [B, L, num_codebooks * sub_embed_size] = [B, L, 128]
+                    num_cb = input_ids.shape[1]
+                    features_per_codebook = []
+                    for cb_idx in range(num_cb):
+                        cb_ids = input_ids[:, cb_idx, :]  # [B, L]
+                        cb_feat = self.tokens_embed(cb_ids)  # [B, L, sub_embed_size]
+                        features_per_codebook.append(cb_feat)
+                    feature = torch.cat(features_per_codebook, dim=-1)  # [B, L, num_codebooks * sub_embed_size]
                 else:
-                    feature = self.tokens_embed(input_ids) # [B, L, hidden_size]
+                    feature = self.tokens_embed(input_ids)  # [B, L, hidden_size]
 
                 feature += position_embeddings
                 if self.use_sequence:
@@ -88,13 +109,22 @@ class ProceedingBaseModel(nn.Module):
             else:
                 if not hasattr(self, "tokens_embed"):
                     feature = input_ids
+                elif is_multi_codebook:
+                    # Multi-codebook with noise
+                    num_cb = input_ids.shape[1]
+                    features_per_codebook = []
+                    for cb_idx in range(num_cb):
+                        cb_ids = input_ids[:, cb_idx, :]
+                        cb_feat = self.tokens_embed(cb_ids)
+                        features_per_codebook.append(cb_feat)
+                    feature = torch.cat(features_per_codebook, dim=-1)
                 else:
                     feature = self.tokens_embed(input_ids)
             # feature: [B, L, hidden_size]
-                
+
             # replace with noise_embedding randomly
-            replace_mask = (torch.rand(feature.shape[0], feature.shape[1], device=feature.device) < self.add_noise) # [bsz, L]
-            replace_mask = replace_mask.unsqueeze(-1) # [bsz, L, 1]
+            replace_mask = (torch.rand(feature.shape[0], feature.shape[1], device=feature.device) < self.add_noise)  # [bsz, L]
+            replace_mask = replace_mask.unsqueeze(-1)  # [bsz, L, 1]
 
             noise_embed_broadcasted = self.noise_embedding.weight.view(1, 1, -1)
             feature = torch.where(replace_mask, noise_embed_broadcasted, feature)
@@ -109,7 +139,7 @@ class ProceedingBaseModel(nn.Module):
 
 class SequenceClassificationModel(ProceedingBaseModel):
 
-    def __init__(self, 
+    def __init__(self,
         model_cfg, codebook_embedding=None,
     ):
         super().__init__()
@@ -135,9 +165,20 @@ class SequenceClassificationModel(ProceedingBaseModel):
         self.sequence_only = model_cfg.sequence_only
         self.add_noise = model_cfg.add_noise
 
+        # Multi-codebook support (MCQ)
+        self.num_codebooks = getattr(model_cfg, 'num_codebooks', None)
+        if self.num_codebooks is not None and self.num_codebooks > 1:
+            # For MCQ: embedding dim is sub_embed_size, final feature dim is num_codebooks * sub_embed_size
+            sub_embed_size = d_model  # d_model here is the sub_embed_size (e.g., 16)
+            effective_d_model = self.num_codebooks * sub_embed_size  # e.g., 8 * 16 = 128
+        else:
+            self.num_codebooks = None
+            sub_embed_size = d_model
+            effective_d_model = d_model
+
         if self.add_noise is not None:
-            self.noise_embedding = nn.Embedding(1, d_model)
-            if self.use_sequence: # prohibit seq + struct tokens for adding noise (not tested)
+            self.noise_embedding = nn.Embedding(1, effective_d_model)
+            if self.use_sequence:  # prohibit seq + struct tokens for adding noise (not tested)
                 assert self.sequence_only
 
         if self.sequence_only:
@@ -147,36 +188,38 @@ class SequenceClassificationModel(ProceedingBaseModel):
 
         # load simple neural layers for benchmarking
         if num_tokens is not None:
-            self.tokens_embed = nn.Embedding(num_tokens, d_model)
+            # For multi-codebook: each lookup returns sub_embed_size, we concatenate to get effective_d_model
+            embed_dim = sub_embed_size if self.num_codebooks else d_model
+            self.tokens_embed = nn.Embedding(num_tokens, embed_dim)
             self.tokens_embed.weight.requires_grad = False
             self.tokens_embed.weight[:len(self.codebook_embedding)] = self.codebook_embedding
         else:
-            pass # use the model encoded continuous representations instead
-        
+            pass  # use the model encoded continuous representations instead
+
         if self.use_sequence:
-            self.sequence_embed = nn.Embedding(26 + 1, d_model)
-        
+            self.sequence_embed = nn.Embedding(26 + 1, effective_d_model)
+
         layer_norm_eps = 1e-12
-        self.tokens_layernorm = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.tokens_layernorm = nn.LayerNorm(effective_d_model, eps=layer_norm_eps)
         self.tokens_dropout = nn.Dropout(dropout)
         
-        max_position_embeddings = 700 # bounded by cfg.data.filter_length
-        self.position_embed = nn.Embedding(max_position_embeddings, d_model)
+        max_position_embeddings = 2000  # increased to handle longer sequences from multi-chain structures
+        self.position_embed = nn.Embedding(max_position_embeddings, effective_d_model)
         self.register_buffer(
             "position_ids", torch.arange(max_position_embeddings).expand((1, -1)), persistent=False
         )
-        
+
         self.is_global_or_local = is_global_or_local
-        if self.is_global_or_local == "global": # protein-wise multi-class classification
+        if self.is_global_or_local == "global":  # protein-wise multi-class classification
             pass
-        elif self.is_global_or_local == "local": # residue-wise binary classification
+        elif self.is_global_or_local == "local":  # residue-wise binary classification
             assert num_labels == 1
         else:
             raise NotImplementedError
-        
-        self.d_model = d_model
+
+        self.d_model = effective_d_model  # Use effective dimension for classifier
         self.classify = SequenceClassificationHead(
-            d_model, hidden_size, num_labels, num_layer, dropout
+            effective_d_model, hidden_size, num_labels, num_layer, dropout
         )
     def proceed_global_prediction(self, input_ids, input_mask, feature, targets):
 
@@ -328,7 +371,7 @@ class ZeroshotProximityModel(ProceedingBaseModel):
             embed = F.normalize(embed, p=2, dim=-1)
             embed = embed.to(torch.float16)
             sim_score = torch.matmul(embed, embed.T)
-            sim_score = sim_score.numpy() * 100
+            sim_score = (sim_score.numpy() * 100).astype(np.int32)  # Biotite requires integer array
             real_num_tokens = sim_score.shape[0]
             self.real_num_tokens = real_num_tokens
             self.alphabet = Alphabet(list(range(real_num_tokens)))
@@ -362,9 +405,9 @@ class ZeroshotProximityModel(ProceedingBaseModel):
                 lst1_embed = F.normalize(lst1, p=2, dim=-1)
                 lst2_embed = F.normalize(lst2, p=2, dim=-1)
                 sim = torch.matmul(lst1_embed, lst2_embed.T) # [L1, L2]
-                sim = sim.detach().cpu().numpy() * 100
+                sim = (sim.detach().cpu().numpy() * 100).astype(np.int32)  # Biotite requires integer array
                 L1, L2 = len(lst1_embed), len(lst2_embed)
-                sim_score = np.zeros((L1 + L2, L1 + L2))
+                sim_score = np.zeros((L1 + L2, L1 + L2), dtype=np.int32)
                 sim_score[:L1, L1:] = sim
 
                 alphabet = Alphabet(list(range(L1 + L2)))

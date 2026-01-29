@@ -1,0 +1,11 @@
+# Experiment: No projection layer
+# Tests whether the projection layer is necessary for L2 -> cosine adaptation
+defaults:
+    - _self_
+    - ../finetune_mcq
+
+model:
+    use_projection: false
+
+experiment_name: mcq_finetune_no_projection
+run_name: no_projection_v1

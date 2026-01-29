@@ -129,10 +129,15 @@ def calculate_tm_rmsd_score(mobile_chain, target_chain):
 
 def pad_structures(items, constant_value=0, dtype=None, truncation_length=600, pad_length=None):
     """Reference to TAPE https://github.com/songlab-cal/tape/blob/6d345c2b2bbf52cd32cf179325c222afd92aec7e/tape/datasets.py#L37
+    Always returns torch.Tensor for consistency with PyTorch training.
     """
     batch_size = len(items)
-    if isinstance(items[0], List):
+    # Convert numpy arrays and lists to tensors
+    if isinstance(items[0], np.ndarray):
+        items = [torch.from_numpy(x) for x in items]
+    elif isinstance(items[0], List):
         items = [torch.tensor(x) for x in items]
+
     if pad_length is None:
         shape = [batch_size] + np.max([x.shape for x in items], 0).tolist()
     else:
@@ -143,10 +148,8 @@ def pad_structures(items, constant_value=0, dtype=None, truncation_length=600, p
     if dtype is None:
         dtype = items[0].dtype
 
-    if isinstance(items[0], np.ndarray):
-        array = np.full(shape, constant_value, dtype=dtype)
-    elif isinstance(items[0], torch.Tensor):
-        array = torch.full(shape, constant_value, dtype=dtype)
+    # Always create torch tensor
+    array = torch.full(shape, constant_value, dtype=dtype)
 
     for arr, x in zip(array, items):
         arrslice = tuple(slice(dim) for dim in x.shape)
@@ -274,3 +277,44 @@ def get_dtype(precision):
         return torch.float32
     else:
         raise NotImplementedError(f"precision {precision} not implemented")
+
+
+def load_sharded_data(file_path, py_logger=None):
+    """Load data from either a single file or sharded format.
+
+    Sharded format:
+    - Main file contains metadata: {"shards": [...], "num_samples": N, "sharded": True}
+    - Data is loaded from shard files listed in metadata
+
+    Single file format:
+    - Standard torch.save format with list of samples
+
+    Returns: list of samples
+    """
+    from tqdm import tqdm
+    import gc
+
+    if py_logger:
+        py_logger.info(f"Loading data from {file_path}...")
+
+    # Try loading the file
+    data = torch.load(file_path, weights_only=False)
+
+    # Check if it's sharded format
+    if isinstance(data, dict) and data.get("sharded", False):
+        if py_logger:
+            py_logger.info(f"Detected sharded data format with {len(data['shards'])} shards")
+
+        all_data = []
+        for shard_path in tqdm(data["shards"], desc="Loading shards"):
+            shard_data = torch.load(shard_path, weights_only=False)
+            all_data.extend(shard_data)
+            del shard_data
+            gc.collect()
+
+        if py_logger:
+            py_logger.info(f"Done sharded loading.")
+        return all_data
+    else:
+        # Standard single-file format
+        return data

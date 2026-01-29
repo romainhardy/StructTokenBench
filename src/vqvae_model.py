@@ -566,6 +566,9 @@ class VQVAEModel(nn.Module):
         self.loss_weight = quantizer_cfg["loss_weight"]
         self.quantizer = eval(quantizer_cfg["quantizer_type"])(**quantizer_cfg)
 
+        # pLDDT-weighted loss configuration
+        self.use_plddt_weighting = model_cfg.get("use_plddt_weighting", False)
+
         self.encoder = VanillaStructureTokenEncoder(
             **model_cfg.encoder,
             n_codes=quantizer_cfg.codebook_size
@@ -618,13 +621,19 @@ class VQVAEModel(nn.Module):
     def forward(self, input_list, use_as_tokenizer=False):
         self._step_count += 1
 
-        coords, attention_mask, residue_index, seq_residue_tokens, pdb_chain = input_list
+        # Support both old format (5 elements) and new format with pLDDT (6 elements)
+        if len(input_list) == 6:
+            coords, attention_mask, residue_index, seq_residue_tokens, pdb_chain, plddt = input_list
+        else:
+            coords, attention_mask, residue_index, seq_residue_tokens, pdb_chain = input_list
+            plddt = None  # No pLDDT weighting
         sequence_id = None
         """
         coords: [B, L, 37, 3]
         attention_mask: [B, L]
         residue_index: [B, L]
         seq_residue_tokens: [B, L]
+        plddt: [B, L] (optional) - confidence scores for loss weighting
         """
 
         if attention_mask is None:
@@ -666,24 +675,28 @@ class VQVAEModel(nn.Module):
             bb_rmsd_list.append(bb_rmsd)
             lddt_list.append(lddt.mean())
 
-        # reconstruction loss: 
+        # reconstruction loss:
         coords_recon = decoded_states["bb_pred"]
-        # (1) backbone geometric distance loss: pairwise L2 distance matrix for 
+
+        # Determine pLDDT weights for loss computation (only if enabled in config)
+        plddt_weights = plddt if (self.use_plddt_weighting and plddt is not None) else None
+
+        # (1) backbone geometric distance loss: pairwise L2 distance matrix for
         # the predicted and true coordinates of the 3 backbone atoms (N, Cα, C)
         geom_dist_loss, geom_dist_metrics = self.compute_geometric_distance(
-            coords_recon, coords[:, :, :3, :], attention_mask) # [B, L, 3, 3]
+            coords_recon, coords[:, :, :3, :], attention_mask, plddt_weights=plddt_weights) # [B, L, 3, 3]
         # (2) backbone geometric direction loss
         geom_dir_loss, geom_dir_metrics = self.compute_geometric_direction(
-            coords_recon, coords[:, :, :3, :], attention_mask)
+            coords_recon, coords[:, :, :3, :], attention_mask, plddt_weights=plddt_weights)
         # (3) backbone binned distance classification
         binned_dist_loss, binned_dist_metrics = self.compute_binned_distance(
-            decoded_states["pairwise_dist_logits"], coords, attention_mask)
+            decoded_states["pairwise_dist_logits"], coords, attention_mask, plddt_weights=plddt_weights)
         # (4) backbone binned direction classification
         binned_dir_loss, binned_dir_metrics = self.compute_binned_direction(
-            decoded_states["pairwise_dir_logits"], coords[:, :, :3, :], attention_mask)
-        # (5) inverse folding 
+            decoded_states["pairwise_dir_logits"], coords[:, :, :3, :], attention_mask, plddt_weights=plddt_weights)
+        # (5) inverse folding
         inverse_folding_loss, inverse_folding_metrics = self.compute_inverse_folding(
-            decoded_states["last_hidden_state"], seq_residue_tokens, attention_mask)
+            decoded_states["last_hidden_state"], seq_residue_tokens, attention_mask, plddt_weights=plddt_weights)
 
         reconstruction_loss = (geom_dist_loss + geom_dir_loss + binned_dist_loss
                                 + binned_dir_loss + inverse_folding_loss).mean()
@@ -754,10 +767,12 @@ class VQVAEModel(nn.Module):
             coords_pred_from_seq = decoded_states_seq["bb_pred"]
 
             ff_geom_dist_loss, ff_geom_dist_metrics = self.compute_geometric_distance(
-                coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone()
+                coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone(),
+                plddt_weights=plddt_weights
             )
             ff_geom_dir_loss, ff_geom_dir_metrics = self.compute_geometric_direction(
-                coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone()
+                coords_pred_from_seq, coords[:, :, :3, :].clone(), attention_mask.clone(),
+                plddt_weights=plddt_weights
             )
 
             # Optionally skip binned losses to save memory
@@ -768,10 +783,12 @@ class VQVAEModel(nn.Module):
                 ff_binned_dir_metrics = {}
             else:
                 ff_binned_dist_loss, ff_binned_dist_metrics = self.compute_binned_distance(
-                    decoded_states_seq["pairwise_dist_logits"], coords.clone(), attention_mask.clone()
+                    decoded_states_seq["pairwise_dist_logits"], coords.clone(), attention_mask.clone(),
+                    plddt_weights=plddt_weights
                 )
                 ff_binned_dir_loss, ff_binned_dir_metrics = self.compute_binned_direction(
-                    decoded_states_seq["pairwise_dir_logits"], coords[:, :, :3, :].clone(), attention_mask.clone()
+                    decoded_states_seq["pairwise_dir_logits"], coords[:, :, :3, :].clone(), attention_mask.clone(),
+                    plddt_weights=plddt_weights
                 )
 
             # Combine forward folding losses
@@ -814,34 +831,54 @@ class VQVAEModel(nn.Module):
         
         return (loss_and_metrics, )
     
-    def compute_geometric_distance(self, x_recon, x, attention_mask, clamp_value=25):
+    def compute_geometric_distance(self, x_recon, x, attention_mask, plddt_weights=None, clamp_value=25):
         """
         x_recon: [B, L, 3, 3]
         x: [B, L, 3, 3]
+        plddt_weights: [B, L] optional confidence weights (0-100 scale, will be normalized)
         """
         assert x_recon.shape[-2] == 3 and x_recon.shape[-1] == 3
-        
+
         # ignore padding regions
         x_recon[~attention_mask] = 0
         x[~attention_mask] = 0
         B, L, E = x.shape[0], x.shape[1], x.shape[-1]
-        x_recon, x = x_recon.reshape(B, -1, E), x.reshape(B, -1, E) # [B, L, 3, 3] -> [B, L * 3, 3] 
+        x_recon, x = x_recon.reshape(B, -1, E), x.reshape(B, -1, E) # [B, L, 3, 3] -> [B, L * 3, 3]
 
         dist_pred = torch.cdist(x_recon, x_recon, p=2.0) # [B, L * 3, L * 3]
         dist_true = torch.cdist(x, x, p=2.0)
 
         dist_mask = attention_mask.repeat(1, 3)
         dist_mask = torch.logical_and(dist_mask.unsqueeze(-1), dist_mask.unsqueeze(1)) # [B, L * 3, L * 3]
+
+        # Compute pLDDT-based pairwise weights if provided
+        if plddt_weights is not None:
+            # Normalize pLDDT to [0, 1] and repeat for 3 backbone atoms
+            weights = (plddt_weights / 100.0).repeat(1, 3)  # [B, L*3]
+            # Pairwise weight = geometric mean of both residues' confidence
+            pair_weights = torch.sqrt(weights.unsqueeze(-1) * weights.unsqueeze(1))  # [B, L*3, L*3]
+            pair_weights = pair_weights[dist_mask]
+        else:
+            pair_weights = None
+
         dist_pred, dist_true = dist_pred[dist_mask], dist_true[dist_mask]
         loss = F.mse_loss(dist_pred, dist_true, reduction="none") # flattened
         loss = torch.clamp(loss, max=clamp_value)
+
+        # Apply pLDDT weighting
+        if pair_weights is not None:
+            weighted_loss = (loss * pair_weights).sum() / (pair_weights.sum() + 1e-8)
+        else:
+            weighted_loss = loss.mean()
+
         metric = {
-            f"geom_dist_loss": loss.mean(),
+            f"geom_dist_loss": loss.mean(),  # Unweighted for comparison
+            f"geom_dist_loss_weighted": weighted_loss if pair_weights is not None else loss.mean(),
             f"geom_dist_loss_below_clamp": loss[loss != clamp_value].mean(),
             f"geom_dist_loss_clamp_ratio_{clamp_value}": (loss != clamp_value).float().mean(),
         }
         # metrics like spearman R is too time consuming to calculate
-        return loss.mean(), metric
+        return weighted_loss, metric
 
     def compute_direction_vectors(self, coords,):
         """
@@ -868,11 +905,12 @@ class VQVAEModel(nn.Module):
         return ret
 
 
-    def compute_geometric_direction(self, x_recon, x, attention_mask, clamp_value=20):
+    def compute_geometric_direction(self, x_recon, x, attention_mask, plddt_weights=None, clamp_value=20):
         """
         x_recon: [B, L, 3, 3]
         x: [B, L, 3, 3]
         attention_mask: [B, L]
+        plddt_weights: [B, L] optional confidence weights (0-100 scale)
         """
         vec_pred = self.compute_direction_vectors(x_recon)
         vec = self.compute_direction_vectors(x)
@@ -883,21 +921,41 @@ class VQVAEModel(nn.Module):
 
         dist_mask = attention_mask[:, 1:-1].repeat(1, 6) # [B, 6(L-2)]
         dist_mask = torch.logical_and(dist_mask.unsqueeze(-1), dist_mask.unsqueeze(1)) # [B, 6(L-2), 6(L-2)]
+
+        # Compute pLDDT-based pairwise weights if provided
+        if plddt_weights is not None:
+            # Trim pLDDT to match direction vectors (exclude first and last residue)
+            plddt_trimmed = plddt_weights[:, 1:-1]  # [B, L-2]
+            weights = (plddt_trimmed / 100.0).repeat(1, 6)  # [B, 6(L-2)]
+            pair_weights = torch.sqrt(weights.unsqueeze(-1) * weights.unsqueeze(1))  # [B, 6(L-2), 6(L-2)]
+            pair_weights = pair_weights[dist_mask]
+        else:
+            pair_weights = None
+
         dist_pred, dist_true = dist_pred[dist_mask], dist_true[dist_mask]
         loss = F.mse_loss(dist_pred, dist_true, reduction="none") # flattened
         loss = torch.clamp(loss, max=clamp_value)
+
+        # Apply pLDDT weighting
+        if pair_weights is not None:
+            weighted_loss = (loss * pair_weights).sum() / (pair_weights.sum() + 1e-8)
+        else:
+            weighted_loss = loss.mean()
+
         metric = {
-            f"geom_dir_loss": loss.mean(),
+            f"geom_dir_loss": loss.mean(),  # Unweighted for comparison
+            f"geom_dir_loss_weighted": weighted_loss if pair_weights is not None else loss.mean(),
             f"geom_dir_loss_below_clamp": loss[loss != clamp_value].mean(),
             f"geom_dir_loss_clamp_ratio_{clamp_value}": (loss != clamp_value).float().mean(),
         }
-        return loss.mean(), metric
+        return weighted_loss, metric
 
-    def compute_binned_direction(self, pairwise_logits, coords, attention_mask):
+    def compute_binned_direction(self, pairwise_logits, coords, attention_mask, plddt_weights=None):
         """
         pairwise_logits: [B, L, L, 96]
         coords: [B, L, 3, 3]
         attention_mask: [B, L]
+        plddt_weights: [B, L] optional confidence weights (0-100 scale)
         """
         # compute from ground truth
         # unit vectors
@@ -928,22 +986,41 @@ class VQVAEModel(nn.Module):
         pairwise_logits = pairwise_logits.reshape([_ for _ in binned_labels.shape] + [-1]) # [B, L, L, 6, NUM_BIN]
 
         mask = torch.logical_and(attention_mask.unsqueeze(-1), attention_mask.unsqueeze(1)) # [B, L, L]
+
+        # Compute pLDDT-based pairwise weights if provided
+        if plddt_weights is not None:
+            weights = plddt_weights / 100.0  # [B, L]
+            pair_weights = torch.sqrt(weights.unsqueeze(-1) * weights.unsqueeze(1))  # [B, L, L]
+            # Expand to match 6 direction pairs and flatten
+            pair_weights = pair_weights.unsqueeze(-1).expand(-1, -1, -1, 6)  # [B, L, L, 6]
+            pair_weights = pair_weights[mask].reshape(-1)
+        else:
+            pair_weights = None
+
         pairwise_logits, binned_labels = pairwise_logits[mask].reshape(-1, NUM_BIN), binned_labels[mask].reshape(-1)
-        
+
         loss_fct = nn.CrossEntropyLoss(reduction="none")
         loss = loss_fct(pairwise_logits, binned_labels)
-        
+
+        # Apply pLDDT weighting
+        if pair_weights is not None:
+            weighted_loss = (loss * pair_weights).sum() / (pair_weights.sum() + 1e-8)
+        else:
+            weighted_loss = loss.mean()
+
         metric = {
-            f"binned_dir_loss": loss.mean(),
+            f"binned_dir_loss": loss.mean(),  # Unweighted for comparison
+            f"binned_dir_loss_weighted": weighted_loss if pair_weights is not None else loss.mean(),
             f"binned_dir_accuracy": (pairwise_logits.argmax(dim=-1) == binned_labels).float().mean(),
         }
-        return loss.mean(), metric
+        return weighted_loss, metric
 
-    def compute_binned_distance(self, pairwise_logits, coords, attention_mask):
+    def compute_binned_distance(self, pairwise_logits, coords, attention_mask, plddt_weights=None):
         """
         pairwise_logits: [B, L, L, 64]
         coords: [B, L, 37, 3]
         attention_mask: [B, L]
+        plddt_weights: [B, L] optional confidence weights (0-100 scale)
         """
 
         # calculate Cbeta
@@ -959,38 +1036,68 @@ class VQVAEModel(nn.Module):
         assert binned_labels.min() >= 0 and binned_labels.max() < NUM_BIN
 
         mask = torch.logical_and(attention_mask.unsqueeze(-1), attention_mask.unsqueeze(1)) # [B, L, L]
+
+        # Compute pLDDT-based pairwise weights if provided
+        if plddt_weights is not None:
+            weights = plddt_weights / 100.0  # [B, L]
+            pair_weights = torch.sqrt(weights.unsqueeze(-1) * weights.unsqueeze(1))  # [B, L, L]
+            pair_weights = pair_weights[mask]
+        else:
+            pair_weights = None
+
         pairwise_logits, binned_labels = pairwise_logits[mask], binned_labels[mask]
-        
+
         loss_fct = nn.CrossEntropyLoss(reduction="none")
         loss = loss_fct(pairwise_logits, binned_labels)
-        
+
+        # Apply pLDDT weighting
+        if pair_weights is not None:
+            weighted_loss = (loss * pair_weights).sum() / (pair_weights.sum() + 1e-8)
+        else:
+            weighted_loss = loss.mean()
+
         metric = {
-            f"binned_dist_loss": loss.mean(),
+            f"binned_dist_loss": loss.mean(),  # Unweighted for comparison
+            f"binned_dist_loss_weighted": weighted_loss if pair_weights is not None else loss.mean(),
             f"binned_dist_accuracy": (pairwise_logits.argmax(dim=-1) == binned_labels).float().mean(),
         }
-        return loss.mean(), metric
+        return weighted_loss, metric
 
-    def compute_inverse_folding(self, h, residue_labels, attention_mask):
+    def compute_inverse_folding(self, h, residue_labels, attention_mask, plddt_weights=None):
         """
         h: [B, L, d_model=1024]
         residue_labels: [B, L]
         attention_mask: [B, L]
+        plddt_weights: [B, L] optional confidence weights (0-100 scale)
         """
         logits = self.inverse_folding_head(h) # [B, L, num_AAs]
-        
+
         if not (logits.shape[0] == attention_mask.shape[0] and logits.shape[1] == attention_mask.shape[1]):
             raise ValueError
-        
+
+        # Compute per-residue pLDDT weights if provided
+        if plddt_weights is not None:
+            weights = (plddt_weights / 100.0)[attention_mask]  # Normalize and flatten
+        else:
+            weights = None
+
         logits, residue_labels = logits[attention_mask], residue_labels[attention_mask]
-        
+
         loss_fct = nn.CrossEntropyLoss(reduction="none")
         loss = loss_fct(logits, residue_labels)
-        
+
+        # Apply pLDDT weighting
+        if weights is not None:
+            weighted_loss = (loss * weights).sum() / (weights.sum() + 1e-8)
+        else:
+            weighted_loss = loss.mean()
+
         metric = {
-            f"inverse_folding_loss": loss.mean(),
+            f"inverse_folding_loss": loss.mean(),  # Unweighted for comparison
+            f"inverse_folding_loss_weighted": weighted_loss if weights is not None else loss.mean(),
             f"inverse_folding_accuracy": (logits.argmax(dim=-1) == residue_labels).float().mean(),
         }
-        return loss.mean(), metric
+        return weighted_loss, metric
     
 
 class LightningVQPretrainModel(pl.LightningModule):

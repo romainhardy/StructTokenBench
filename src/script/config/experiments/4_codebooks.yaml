@@ -1,0 +1,14 @@
+# Experiment: Fewer, larger codebooks
+# 4 codebooks with 128 entries each (vs 8 codebooks with 64 entries)
+defaults:
+    - _self_
+    - ../finetune_mcq
+
+model:
+    quantizer:
+        codebook_size: 512           # 512/4 = 128 entries per codebook
+        codebook_embed_size: 128     # 128/4 = 32 dims per codebook
+        num_codebooks: 4
+
+experiment_name: mcq_finetune_4_codebooks
+run_name: 4_codebooks_v1

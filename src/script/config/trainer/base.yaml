@@ -18,3 +18,4 @@ reload_dataloaders_every_n_epochs: 1 #fine for mmap arrow files
 val_check_interval: 1.0 #leave null, will be set to occur 1 step before checkpointing
 accumulate_grad_batches: 1
 deterministic: true
+fast_dev_run: false

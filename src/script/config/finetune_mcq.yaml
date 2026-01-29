@@ -1,0 +1,89 @@
+# Fine-tuning config for adapting pre-trained AminoAseed encoder to MCQ quantization
+# Stage 1: Establish strong structure reconstruction with frozen encoder + MCQ
+defaults:
+    - pretrain  # Inherit base pretrain config
+    - _self_
+
+model:
+    class_name: "AminoAseedMCQFinetune"
+
+    # Path to pre-trained checkpoint (encoder + decoder weights)
+    pretrained_ckpt_path: /home/romainlhardy/code/protein/models/codebook_512x1024-1e+19-linear-fixed-last.ckpt/checkpoint/mp_rank_00_model_states.pt
+
+    # Fine-tuning configuration
+    freeze_encoder: true      # Freeze pre-trained encoder
+    use_projection: true      # Add projection layer (L2 -> cosine adaptation)
+    warm_start_decoder: true  # Initialize decoder from pre-trained weights
+
+    # MCQ Quantizer configuration
+    quantizer:
+        quantizer_type: MCQQuantizer
+        codebook_size: 512           # Total entries across all codebooks (512/8 = 64 per codebook)
+        codebook_embed_size: 128     # Total embedding dimension (128/8 = 16 per codebook)
+        num_codebooks: 8             # Number of sub-codebooks
+        normalize_embeddings: true   # Use cosine similarity (L2 normalized)
+        _need_init: true             # Initialize codebooks from data on first forward
+        freeze_codebook: false       # Train codebooks
+
+        # Codebook specialization for multi-modal training (Stage 2+)
+        # Uncomment to enable:
+        # codebook_groups:
+        #     structure: [0, 1]  # Updated by reconstruction loss
+        #     sequence: [2, 3]   # Updated by forward folding loss
+        #     function: [4, 5]   # Updated by CLIP loss
+        #     shared: [6, 7]     # Updated by all losses
+
+        loss_weight:
+            commitment_loss_weight: 0.25
+            quantization_loss_weight: 1.0
+            reconstruction_loss_weight: 1.0
+
+    # Encoder config (must match pre-trained model)
+    encoder:
+        d_model: 1024
+        n_heads: 1
+        v_heads: 128
+        n_layers: 2
+        d_out: 1024  # Must match pre-trained model; projection layer adapts to MCQ dim
+
+    # Decoder config (must match pre-trained model)
+    decoder:
+        d_model: 1024
+        n_heads: 16
+        n_layers: 8
+
+# Quick iteration settings: use subsampled data and limited batches
+data:
+    data_version: mmcif_files_filtered_subsample1.5  # 7,872 samples
+    pdb_data_dir: /home/romainlhardy/data/protein/pdb_data
+
+# Training settings
+max_steps: 10000
+
+trainer:
+    default_root_dir: /home/romainlhardy/code/protein/logs/mcq_finetune
+    limit_train_batches: null   # Use full dataset
+    limit_val_batches: null     # Use full validation
+
+# Override logger to use W&B
+lightning:
+    logger:
+        _target_: pytorch_lightning.loggers.WandbLogger
+        project: mcq_finetune
+        name: ${run_name}
+        save_dir: ${trainer.default_root_dir}
+        log_model: false
+
+experiment_name: mcq_finetune
+run_name: mcq_finetune_stage1
+
+# Optimization settings for longer training
+optimization:
+    scheduler:
+        num_warmup_steps: 500  # Increased warmup for 10k steps
+
+# DeepSpeed config path (absolute)
+deepspeed_path: /home/romainlhardy/code/protein/external/StructTokenBench/src/script/config/deepspeed/32_stage2.json
+
+# Data directory
+default_data_dir: /home/romainlhardy/data/protein/struct_token_bench_release_data

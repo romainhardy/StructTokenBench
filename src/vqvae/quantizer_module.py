@@ -167,7 +167,20 @@ class MCQQuantizer(nn.Module):
 
     Uses multiple independent sub-codebooks, each handling a portion of the
     embedding dimension. This improves codebook utilization and representation capacity.
+
+    Supports codebook specialization via codebook_groups:
+    - Different codebooks can be designated for different modalities
+    - Gradients are routed only to active codebooks based on loss_type
+    - Example: {"structure": [0, 1], "sequence": [2, 3], "function": [4, 5], "shared": [6, 7]}
     """
+
+    # Default codebook groups for multi-modal training
+    DEFAULT_CODEBOOK_GROUPS = {
+        "structure": [0, 1],   # Updated by reconstruction loss
+        "sequence": [2, 3],    # Updated by forward folding loss
+        "function": [4, 5],    # Updated by CLIP loss
+        "shared": [6, 7],      # Updated by all losses
+    }
 
     def __init__(
         self,
@@ -180,6 +193,7 @@ class MCQQuantizer(nn.Module):
         normalize_embeddings: bool = True,
         _need_init: bool = True,
         freeze_codebook: bool = False,
+        codebook_groups: dict = None,
         **kwargs
     ):
         super().__init__()
@@ -203,6 +217,10 @@ class MCQQuantizer(nn.Module):
 
         self._need_init = _need_init
         self.freeze_codebook = freeze_codebook
+
+        # Codebook groups for specialization
+        # If not provided, all codebooks receive gradients from all losses
+        self.codebook_groups = codebook_groups
 
         self.codebooks = nn.ModuleList([
             nn.Embedding(self.sub_codebook_size, self.sub_embed_size)
@@ -299,18 +317,60 @@ class MCQQuantizer(nn.Module):
 
         return result
 
-    def forward(self, z: torch.Tensor):
+    def _get_active_codebooks(self, loss_type: str) -> set:
+        """
+        Get the set of codebook indices that should receive gradients for a given loss type.
+
+        Args:
+            loss_type: One of "all", "structure", "sequence", "function", or custom group name
+
+        Returns:
+            Set of codebook indices that should be active (receive gradients)
+        """
+        if loss_type == "all" or self.codebook_groups is None:
+            return set(range(self.num_codebooks))
+
+        active = set()
+        # Add codebooks for the specified loss type
+        if loss_type in self.codebook_groups:
+            active.update(self.codebook_groups[loss_type])
+        # Always include shared codebooks
+        if "shared" in self.codebook_groups:
+            active.update(self.codebook_groups["shared"])
+
+        return active
+
+    def forward(self, z: torch.Tensor, loss_type: str = "all"):
+        """
+        Forward pass with optional codebook specialization.
+
+        Args:
+            z: Input tensor of shape [B, L, codebook_embed_size]
+            loss_type: Type of loss being computed. Used for codebook specialization.
+                      One of "all", "structure", "sequence", "function", or custom group name.
+                      If codebook_groups is None, this parameter is ignored.
+
+        Returns:
+            quantized_z: Quantized embeddings [B, L, codebook_embed_size]
+            quantized_indices: Codebook indices [B, num_codebooks, L]
+            loss: Combined commitment and quantization loss
+            metrics: Dictionary of metrics including per-codebook usage
+        """
         if self._need_init and self.training:
             self._init_embeddings(z)
 
         batch_size, seq_length, _ = z.shape
         chunks = z.split(self.sub_embed_size, dim=-1)
 
+        # Get active codebooks for gradient routing
+        active_codebooks = self._get_active_codebooks(loss_type)
+
         all_quantized = []
         all_indices = []
         total_commitment_loss = 0.0
         total_quantization_loss = 0.0
         total_vocab_usage = 0.0
+        per_codebook_usage = []
 
         for i, chunk in enumerate(chunks):
             flat_chunk = chunk.reshape(-1, self.sub_embed_size)
@@ -341,16 +401,24 @@ class MCQQuantizer(nn.Module):
             total_commitment_loss += commitment_loss
             total_quantization_loss += quantization_loss
 
+            # Straight-through estimator with codebook specialization
             quantized = flat_chunk_norm + (quantized - flat_chunk_norm).detach()
             quantized = quantized.view(batch_size, seq_length, self.sub_embed_size)
+
+            # Codebook specialization: detach gradients for inactive codebooks
+            if i not in active_codebooks:
+                quantized = quantized.detach()
 
             indices = indices.view(batch_size, seq_length)
             all_quantized.append(quantized)
             all_indices.append(indices)
 
+            # Track per-codebook usage
             with torch.no_grad():
                 unique_indices = torch.unique(indices)
-                total_vocab_usage += len(unique_indices)
+                usage = len(unique_indices)
+                total_vocab_usage += usage
+                per_codebook_usage.append(usage / self.sub_codebook_size)  # Utilization ratio
 
         quantized_z = torch.cat(all_quantized, dim=-1)
         quantized_indices = torch.stack(all_indices, dim=1)
@@ -367,6 +435,11 @@ class MCQQuantizer(nn.Module):
             "commitment_loss": avg_commitment_loss,
             "quantization_loss": avg_quantization_loss,
             "vocab_usage": total_vocab_usage / self.num_codebooks,
+            "avg_codebook_utilization": sum(per_codebook_usage) / len(per_codebook_usage),
         }
+
+        # Add per-codebook utilization metrics
+        for i, util in enumerate(per_codebook_usage):
+            metrics[f"codebook_{i}_utilization"] = util
 
         return quantized_z, quantized_indices, loss, metrics

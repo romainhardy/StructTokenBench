@@ -168,27 +168,60 @@ class BaseDataset(Dataset):
         for key in ALL_TOKENIZER_TYPE["continuous"]:
             cont_flag.append(isinstance(self.tokenizer, eval(key)))
         disc_flag, cont_flag = any(disc_flag), any(cont_flag)
-        
+
+        # Check for multi-codebook case (MCQ): input_ids has shape [num_codebooks, L]
+        is_multi_codebook = disc_flag and input_ids[0].dim() == 2 and not self.use_continuous
+
         if cont_flag:
             length_list = [len(x) for x in input_ids]
-        
-        input_ids = util.pad_structures(input_ids, 
-                        constant_value=self.structure_pad_token_id, 
-                        truncation_length=self.truncation_length)
+        elif is_multi_codebook:
+            # For multi-codebook, length is the last dimension
+            length_list = [x.shape[-1] for x in input_ids]
+
+        if is_multi_codebook:
+            # Handle multi-codebook padding: shape [num_codebooks, L] per sample
+            # Pad to [B, num_codebooks, max_L]
+            num_codebooks = input_ids[0].shape[0]
+            max_len = min(max(x.shape[-1] for x in input_ids), self.truncation_length)
+
+            batched_input_ids = torch.full(
+                (len(input_ids), num_codebooks, max_len),
+                self.structure_pad_token_id,
+                dtype=input_ids[0].dtype
+            )
+            for i, ids in enumerate(input_ids):
+                seq_len = min(ids.shape[-1], max_len)
+                batched_input_ids[i, :, :seq_len] = ids[:, :seq_len]
+            input_ids = batched_input_ids
+        else:
+            input_ids = util.pad_structures(input_ids,
+                            constant_value=self.structure_pad_token_id,
+                            truncation_length=self.truncation_length)
         # input_ids:
-        ## discretized verson: [B, L] for structural ids
+        ## discretized version: [B, L] for structural ids
+        ## multi-codebook version: [B, num_codebooks, L] for MCQ
         ## continuous version: [B, L, hidden_dim] (e.g., for tokenizer like ProteinMPNN)
-        
+
         if disc_flag:
-            input_mask = input_ids == self.structure_pad_token_id
+            if is_multi_codebook:
+                # For multi-codebook, mask is based on any codebook being padded (use first)
+                input_mask = input_ids[:, 0, :] == self.structure_pad_token_id  # [B, L]
+            else:
+                input_mask = input_ids == self.structure_pad_token_id
         elif cont_flag:
             input_mask = torch.ones((input_ids.shape[0], input_ids.shape[1]), dtype=torch.bool, device=input_ids.device)
             for i in range(len(input_mask)):
                 input_mask[i][length_list[i]:] = False
             input_mask = ~input_mask
         else:
-            raise NotImplementedError  
+            raise NotImplementedError
         # input_mask: always [B, L]
+
+        # Determine sequence length dimension for labels/seqs padding
+        if is_multi_codebook:
+            seq_dim_len = input_ids.shape[2]  # [B, num_codebooks, L]
+        else:
+            seq_dim_len = input_ids.shape[1]  # [B, L] or [B, L, hidden_dim]
 
         try:
             labels = torch.LongTensor(labels)
@@ -196,16 +229,16 @@ class BaseDataset(Dataset):
         except:
             labels = util.pad_structures(labels, constant_value=-100,
                         truncation_length=self.truncation_length,
-                        pad_length=input_ids.shape[1])
-            assert labels.shape == input_ids.shape[:2]
+                        pad_length=seq_dim_len)
+            assert labels.shape[0] == input_ids.shape[0] and labels.shape[1] == seq_dim_len
             # labels: always [B, L] for local labels
-        
+
         for seq in seqs:
             assert max(seq) < 26
         seqs = util.pad_structures(seqs, constant_value=26, # 26 alphabets
                         truncation_length=self.truncation_length,
-                        pad_length=input_ids.shape[1])
-        assert seqs.shape == input_ids.shape[:2]
+                        pad_length=seq_dim_len)
+        assert seqs.shape[0] == input_ids.shape[0] and seqs.shape[1] == seq_dim_len
 
         return {
             "input_list": (input_ids, input_mask, seqs),
@@ -329,12 +362,20 @@ class BaseDataset(Dataset):
         return file
     
     def _get_item_structural_tokens(self, index, skip_check=False):
-        
+
         item = self.data[index]
         if not skip_check:
             if "token_ids" in item:
                 if self.is_global_or_local == "local":
-                    assert len(item["token_ids"]) == len(item[self.target_field])
+                    token_ids = item["token_ids"]
+                    # Handle multi-codebook case (MCQ): token_ids has shape [num_codebooks, L]
+                    # For continuous mode, shape is [L, hidden_dim], so use len()
+                    # For discrete multi-codebook, shape is [num_codebooks, L], so use shape[-1]
+                    if isinstance(token_ids, torch.Tensor) and token_ids.dim() == 2 and not self.use_continuous:
+                        token_len = token_ids.shape[-1]  # Use last dimension for sequence length
+                    else:
+                        token_len = len(token_ids)
+                    assert token_len == len(item[self.target_field])
                 return item["token_ids"], item[self.target_field], item["real_seqs"]
     
         pdb_chain, residue_range = item["pdb_chain"], item["residue_range"]
@@ -388,23 +429,40 @@ class BaseDataset(Dataset):
         elif isinstance(self.tokenizer, WrappedCheapS1D64Tokenizer):
             # CheapS1D64 is continuous tokenizer
             token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_path, chain_id, self.use_sequence)
+        elif isinstance(self.tokenizer, WrappedGCPVQVAETokenizer):
+            token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_path, chain_id, self.use_continuous, self.use_sequence)
+        elif isinstance(self.tokenizer, WrappedMCQTokenizer):
+            token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_chain, self.use_continuous, self.use_sequence)
         else:
             raise NotImplementedError
         
-        assert len(token_ids) == len(residue_index)
+        # Handle multi-codebook case: token_ids may be [num_codebooks, L] for MCQ
+        is_multi_codebook = token_ids.dim() == 2 and not self.use_continuous
+        if is_multi_codebook:
+            # For multi-codebook, sequence length is the last dimension
+            seq_len = token_ids.shape[-1]
+        else:
+            seq_len = len(token_ids)
+
+        assert seq_len == len(residue_index)
         # code compatability in case token_ids store continuous reprs
         token_ids = token_ids.detach()
         assert len(residue_index) == len(seqs)
-        
+
         if self.is_global_or_local == "local":
             # align residue_index and label_residue_index, so that token_ids align with assigned_labels
-            org_len = len(token_ids)
+            org_len = seq_len
             align_indices_1 = [i for i, x in enumerate(label_residue_index) if x in residue_index]
             label_residue_index = np.array(label_residue_index)[align_indices_1].tolist()
             assigned_labels = np.array(assigned_labels)[align_indices_1].tolist()
 
             align_indices_2 = [i for i, x in enumerate(residue_index) if x in label_residue_index]
-            residue_index, token_ids = residue_index[align_indices_2], token_ids[align_indices_2]
+            residue_index = residue_index[align_indices_2]
+            # Handle multi-codebook indexing: index the last dimension
+            if is_multi_codebook:
+                token_ids = token_ids[:, align_indices_2]  # [num_codebooks, L']
+            else:
+                token_ids = token_ids[align_indices_2]
             seqs = [x for i,x in enumerate(seqs) if i in set(align_indices_2)]
 
             try:
@@ -412,14 +470,14 @@ class BaseDataset(Dataset):
             except:
                 # deal with repeated residue indices and achieve exact match with alignment
                 idx_list = list(set(residue_index.tolist() + label_residue_index))
-                
+
                 alphabet = Alphabet(idx_list)
                 sim_score = np.diag(np.ones(len(idx_list)))
                 substitution_matrix = SubstitutionMatrix(alphabet, alphabet, sim_score)
                 seq1 = GeneralSequence(alphabet, label_residue_index)
                 seq2 = GeneralSequence(alphabet, residue_index.tolist())
                 alignment = align_optimal(seq1, seq2, substitution_matrix)
-                
+
                 alignment = alignment[0].trace
                 align_indices_1, align_indices_2 = [], []
                 for i in range(len(alignment)):
@@ -429,18 +487,27 @@ class BaseDataset(Dataset):
 
                 label_residue_index = np.array(label_residue_index)[align_indices_1].tolist()
                 assigned_labels = np.array(assigned_labels)[align_indices_1].tolist()
-                residue_index, token_ids = residue_index[align_indices_2], token_ids[align_indices_2]
+                residue_index = residue_index[align_indices_2]
+                # Handle multi-codebook indexing
+                if is_multi_codebook:
+                    token_ids = token_ids[:, align_indices_2]
+                else:
+                    token_ids = token_ids[align_indices_2]
                 seqs = [x for i,x in enumerate(seqs) if i in set(align_indices_2)]
 
-
-            if org_len - len(token_ids) != 0:
-                print(">> residue reduced by : ", org_len - len(token_ids))
+            new_len = token_ids.shape[-1] if is_multi_codebook else len(token_ids)
+            if org_len - new_len != 0:
+                print(">> residue reduced by : ", org_len - new_len)
 
         # select according to residue range constraints for some global tasks
         selected_indices = self._get_selected_indices(residue_index, residue_range)
         assert len(selected_indices) != 0
-        
-        token_ids = token_ids[selected_indices]
+
+        # Handle multi-codebook indexing for selection
+        if is_multi_codebook:
+            token_ids = token_ids[:, selected_indices]  # [num_codebooks, L']
+        else:
+            token_ids = token_ids[selected_indices]
         seqs = np.array(seqs)[selected_indices].tolist()
         if self.is_global_or_local == "local":
             assigned_labels = np.array(assigned_labels)[selected_indices].tolist()
@@ -450,8 +517,10 @@ class BaseDataset(Dataset):
         self.data[index][self.target_field] = assigned_labels
         self.data[index]["real_seqs"] = seqs
         if self.is_global_or_local == "local":
-            assert len(token_ids) == len(assigned_labels)
-        return token_ids, assigned_labels, seqs # torch.Tensor, List
+            # Handle multi-codebook case: token_ids may be [num_codebooks, L]
+            token_seq_len = token_ids.shape[-1] if token_ids.dim() == 2 else len(token_ids)
+            assert token_seq_len == len(assigned_labels)
+        return token_ids, assigned_labels, seqs  # torch.Tensor, List
 
     def __getitem__(self, index: int):
         return self._get_item_structural_tokens(index)
@@ -549,6 +618,8 @@ class BaseDataset(Dataset):
             tokenizer_name = name_list[index]
             if isinstance(self.tokenizer, WrappedOurPretrainedTokenizer):
                 tokenizer_name += f"_{self.tokenizer.ckpt_name}"
+            elif isinstance(self.tokenizer, WrappedMCQTokenizer):
+                tokenizer_name += f"_{self.tokenizer.ckpt_name}"
 
             # use continous reprs
             continuous_flag = self.use_continuous
@@ -579,6 +650,7 @@ class BaseDataset(Dataset):
         self.additional_preprocessing_for_TAPE_homo(tokenizer_name)
 
         # pre-checking
+        skip_indices = []
         for index in tqdm(range(len(self))):
             try:
                 self[index]
@@ -588,7 +660,18 @@ class BaseDataset(Dataset):
                                     f"you're using your own PST, you can skip wrongly "
                                     f"indexed samples for your PST. But please be aware that "
                                     f"other PST benchmakred by the authors all used these samples")
-                raise IndexError
+                # For GCPVQVAE and MCQ, skip failing samples instead of raising error
+                if tokenizer_name in ("gcpvqvae", "mcq_MCQ", "ourpretrained_AminoAseed"):
+                    skip_indices.append(index)
+                else:
+                    raise IndexError
+
+        # Filter out failing samples for VQ-VAE tokenizers
+        if skip_indices:
+            self.py_logger.info(f"Skipping {len(skip_indices)} failing samples for {tokenizer_name}: {skip_indices[:10]}{'...' if len(skip_indices) > 10 else ''}")
+            new_data = [self.data[i] for i in range(len(self.data)) if i not in set(skip_indices)]
+            self.data = new_data
+
         if flag:
             torch.save(self.data, cache_file_name)
 

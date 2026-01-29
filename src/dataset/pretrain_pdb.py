@@ -66,7 +66,7 @@ class PretrainPDBDataset(BaseDataset):
                 self.process_data_from_scratch_and_save(*args, **kwargs)
                 exit(0) # only support for first time preprocessing data and then training for the pretraining data
             else:
-                self.data = torch.load(target_split_file, weights_only=False)
+                self.data = util.load_sharded_data(target_split_file, self.py_logger)
                 self.py_logger.info(f"Loading from processed file {target_split_file},"
                                 f"structured data of {len(self.data)} entries.")
         else:
@@ -93,8 +93,12 @@ class PretrainPDBDataset(BaseDataset):
         }
 
     def get_pdb_chain_list(self, pdb_id, chain_id_list):
-        file = os.path.join(self.PDB_DATA_DIR, f"mmcif_files/{pdb_id}.cif")
-        protein_chain_list = WrappedProteinChain.from_cif_list(file, 
+        # Handle AlphaFold Swiss-Prot structures (AF-* naming convention)
+        if pdb_id.startswith("AF-"):
+            file = os.path.join(self.PDB_DATA_DIR, f"alphafold_swissprot/{pdb_id}.cif")
+        else:
+            file = os.path.join(self.PDB_DATA_DIR, f"mmcif_files/{pdb_id}.cif")
+        protein_chain_list = WrappedProteinChain.from_cif_list(file,
                                             chain_id_list=chain_id_list, id=pdb_id)
 
         return protein_chain_list
@@ -152,10 +156,15 @@ class PretrainPDBDataset(BaseDataset):
             tmp = "-sampled5"
         elif self.data_version == "mmcif_files_filtered_subsample10":
             tmp = "-sampled10"
+        elif self.data_version == "alphafold_swissprot":
+            tmp = None  # Use dedicated Swiss-Prot file
         else:
             assert NotImplementedError
-        
-        file = os.path.join(self.data_path, f"filtered_chain_data_cache{tmp}.json")
+
+        if tmp is not None:
+            file = os.path.join(self.data_path, f"filtered_chain_data_cache{tmp}.json")
+        else:
+            file = os.path.join(self.data_path, "alphafold_swissprot_chain_data.json")
         
         pdb_chain_id_list = list(json.load(open(file, "rb")).keys())
 
@@ -164,7 +173,8 @@ class PretrainPDBDataset(BaseDataset):
         # group chain_id for the same pdb_id
         pdb_chain_id_group = {}
         for pdb_chain_id in sorted(pdb_chain_id_list):
-            pdb_id, chain_id = pdb_chain_id.strip().split("_")
+            # Use rsplit to handle IDs with multiple underscores (e.g., AlphaFold Swiss-Prot)
+            pdb_id, chain_id = pdb_chain_id.strip().rsplit("_", 1)
             if pdb_id in pdb_chain_id_group:
                 pdb_chain_id_group[pdb_id].append(chain_id)
             else:
@@ -235,23 +245,28 @@ class PretrainPDBDataset(BaseDataset):
         """passed to DataLoader as collate_fn argument"""
         batch = list(filter(lambda x: x is not None, batch))
 
-        coords, residue_index, seq_ids, pdb_chain = tuple(zip(*batch))
-        
-        coords = util.pad_structures(coords, 
+        coords, residue_index, seq_ids, pdb_chain, plddt = tuple(zip(*batch))
+
+        coords = util.pad_structures(coords,
                         constant_value=torch.inf,
                         truncation_length=self.truncation_length)
         attention_mask = coords[:, :, 0, 0] == torch.inf
         residue_index = util.pad_structures(residue_index, constant_value=0,
                         truncation_length=self.truncation_length,
                         pad_length=coords.shape[1])
-        
+
         assert C.SEQUENCE_PAD_TOKEN == 1
         seq_ids = util.pad_structures(seq_ids, constant_value=1, # pad_token_id not work anymore, Jan 14
                         truncation_length=self.truncation_length,
                         pad_length=coords.shape[1])
-        
+
+        # Pad pLDDT with 0 (no contribution from padding)
+        plddt = util.pad_structures(plddt, constant_value=0,
+                        truncation_length=self.truncation_length,
+                        pad_length=coords.shape[1])
+
         return {
-            "input_list": (coords, attention_mask, residue_index, seq_ids, pdb_chain)
+            "input_list": (coords, attention_mask, residue_index, seq_ids, pdb_chain, plddt)
         }
     
     def load_all_structures(self, ):
@@ -270,6 +285,10 @@ class PretrainPDBDataset(BaseDataset):
 
     def __getitem__(self, index: int):
         item = self.data[index]
-        coords, residue_index, seq_ids, pdb_chain = item["coords"], item["residue_index"], item["seq_ids"], item["pdb_chain"]
-        
-        return coords, residue_index, seq_ids, pdb_chain
+        coords, residue_index, seq_ids = item["coords"], item["residue_index"], item["seq_ids"]
+        # Support both "pdb_chain" (original format) and "sequence" (preprocessed format)
+        pdb_chain = item.get("pdb_chain", item.get("sequence", None))
+        # pLDDT for confidence-weighted loss (default to 1.0 if not available)
+        plddt = item.get("plddt", torch.ones(coords.shape[0]))
+
+        return coords, residue_index, seq_ids, pdb_chain, plddt

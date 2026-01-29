@@ -22,6 +22,7 @@ def model_init_fn(trainer, model_cfg, **model_kwargs):
     
     from model_module import SequenceClassificationModel, ZeroshotProximityModel, ZeroShotCodebookUtilityModel
     from vqvae_model import VQVAEModel
+    from vqvae_finetune_model import AminoAseedMCQFinetune
 
     with context:
         model = eval(model_cfg.class_name)(

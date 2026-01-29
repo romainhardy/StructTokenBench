@@ -68,6 +68,12 @@ except ModuleNotFoundError:
     print("[Warining]: cheap not found")
     pass
 
+# ----- GCP-VQVAE Loading ------- #
+try:
+    from gcp_vqvae import GCPVQVAE
+except ModuleNotFoundError:
+    print("[Warining]: gcp_vqvae not found")
+
 
 # ----- ProteinMPNN Loading ------- #
 try:
@@ -98,6 +104,8 @@ ALL_TOKENIZER_TYPE = {
         "WrappedProTokensTokenizer",
         "WrappedOurPretrainedTokenizer",
         "WrappedAIDOTokenizer",
+        "WrappedGCPVQVAETokenizer",
+        "WrappedMCQTokenizer",
     ],
     "continuous": [
         "WrappedMIFTokenizer",
@@ -374,6 +382,142 @@ class WrappedOurPretrainedTokenizer():
             return quantized_indices.squeeze(0), np.array(residue_index.squeeze(0).cpu()), seqs # [L], [L]
 
 
+class WrappedMCQTokenizer():
+    """Tokenizer for MCQ-finetuned model with multi-codebook quantization."""
+
+    def __init__(self, device: torch.device | str = "cpu", model_cfg=None, pretrained_ckpt_path=None, ckpt_name=None):
+        self.device = device
+
+        # Load MCQ model
+        from vqvae_finetune_model import AminoAseedMCQFinetune
+        self.model = AminoAseedMCQFinetune(model_cfg=model_cfg)
+
+        # Load checkpoint (DeepSpeed format)
+        ckpt = torch.load(pretrained_ckpt_path, map_location=self.device)
+        if "module" in ckpt:
+            state_dict = ckpt["module"]
+        else:
+            state_dict = ckpt
+
+        # Handle potential key prefixes
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("model."):
+                new_state_dict[k[6:]] = v
+            else:
+                new_state_dict[k] = v
+
+        self.model.load_state_dict(new_state_dict, strict=False)
+
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        self.seq_tokenizer = EsmSequenceTokenizer()
+        self.ckpt_name = ckpt_name
+
+        # MCQ has multiple codebooks - compute total vocab size
+        # num_codebooks * sub_codebook_size + special tokens
+        num_codebooks = self.model.quantizer.num_codebooks
+        sub_codebook_size = self.model.quantizer.sub_codebook_size
+        self.pad_token_id = num_codebooks * sub_codebook_size + 3
+
+    def get_num_tokens(self):
+        """Return total vocabulary size across all codebooks (with offset)."""
+        num_codebooks = self.model.quantizer.num_codebooks
+        sub_codebook_size = self.model.quantizer.sub_codebook_size
+        return num_codebooks * sub_codebook_size + 5  # 512 + 5 special tokens
+
+    def get_codebook_embedding(self):
+        """Return concatenated codebook embeddings with proper offset structure.
+
+        Returns:
+            Tensor of shape [total_vocab, sub_embed_size] = [512, 16]
+            Index i maps to codebook (i // sub_codebook_size), entry (i % sub_codebook_size)
+        """
+        weights = [cb.weight for cb in self.model.quantizer.codebooks]
+        return torch.cat(weights, dim=0)  # [512, 16]
+
+    def get_num_codebooks(self):
+        """Return number of sub-codebooks for multi-codebook handling."""
+        return self.model.quantizer.num_codebooks
+
+    def get_sub_embed_size(self):
+        """Return embedding dimension per sub-codebook."""
+        return self.model.quantizer.sub_embed_size
+
+    def encode_structure(self, pdb_chain, use_continuous=False, use_sequence=False):
+        assert use_sequence
+
+        coords, plddt, residue_index = pdb_chain.to_structure_encoder_inputs(self.device)
+        attention_mask = coords[:, :, 0, 0] == torch.inf
+
+        sequence = pdb_chain.sequence
+        sequence = sequence.replace(C.MASK_STR_SHORT, "<mask>")
+
+        seq_ids = self.seq_tokenizer.encode(sequence, add_special_tokens=False)
+        seq_ids = torch.tensor(seq_ids, dtype=torch.int64, device=self.device)
+        assert len(seq_ids) == len(coords[0])
+
+        input_list = (coords, attention_mask, residue_index, seq_ids, pdb_chain)
+
+        with torch.no_grad():
+            # Get encoder output using the model's encode method
+            # The encode method already applies pre_vq_proj to get d_out dimension
+            encoder_out = self.model.encode(coords, attention_mask, residue_index=residue_index)
+
+            # Apply projection if encoder d_out doesn't match MCQ dimension
+            if hasattr(self.model, 'projection') and not isinstance(self.model.projection, torch.nn.Identity):
+                # Check if dimensions match
+                if encoder_out.shape[-1] == self.model.projection[0].in_features:
+                    z = self.model.projection(encoder_out)
+                else:
+                    # Encoder already outputs MCQ dimension, skip projection
+                    z = encoder_out
+            else:
+                z = encoder_out
+
+            # Quantize with MCQ (returns: quantized_z, indices, loss, metrics)
+            quantized_z, quantized_indices, _, metrics = self.model.quantizer(z)
+
+            # For continuous, use the unprojected representation (back to decoder dim)
+            if use_continuous:
+                if hasattr(self.model, 'unprojection') and not isinstance(self.model.unprojection, torch.nn.Identity):
+                    reprs = self.model.unprojection(quantized_z)
+                else:
+                    reprs = quantized_z
+
+        seqs = [Bio.PDB.Polypeptide.one_to_index(x) if x != "X" else 20 for x in pdb_chain.sequence]
+
+        if use_continuous:
+            return reprs.squeeze(0), np.array(residue_index.squeeze(0).cpu()), seqs
+        else:
+            # MCQ returns [B, num_codebooks, L]
+            # Apply offset to create global vocabulary:
+            # - Codebook 0: indices 0-63
+            # - Codebook 1: indices 64-127
+            # - ...
+            # - Codebook 7: indices 448-511
+            if quantized_indices.dim() == 3:
+                num_codebooks = quantized_indices.shape[1]
+                sub_codebook_size = self.model.quantizer.sub_codebook_size
+
+                # Create offsets: [0, 64, 128, ..., 448] for 8 codebooks with 64 entries each
+                offsets = torch.arange(num_codebooks, device=quantized_indices.device) * sub_codebook_size
+                offsets = offsets.view(1, num_codebooks, 1)  # [1, num_codebooks, 1]
+
+                # Apply offsets to get global indices
+                global_indices = quantized_indices + offsets  # [B, num_codebooks, L]
+
+                # Return shape [num_codebooks, L] for single sample
+                discrete_tokens = global_indices.squeeze(0)  # [num_codebooks, L]
+            else:
+                discrete_tokens = quantized_indices.squeeze(0)
+
+            return discrete_tokens, np.array(residue_index.squeeze(0).cpu()), seqs
+
+
 class WrappedESM3Tokenizer():
 
     
@@ -558,3 +702,115 @@ class WrappedProteinMPNNTokenizer():
         assert len(pdb_dict_list[0]["seq"]) == len(h_V[0])
         seqs = [Bio.PDB.Polypeptide.one_to_index(x) if x != "X" else 20 for x in pdb_dict_list[0]["seq"]] # total 20 standard AA in Bio
         return h_V.squeeze(0), pdb_dict_list[0]["ridx"], seqs # [L, 128], [L]
+
+
+class WrappedGCPVQVAETokenizer():
+    """
+    Tokenizer wrapper for GCP-VQVAE (Graph Convolutional Protein Vector Quantized VAE).
+    Uses temp directory approach since GCP-VQVAE expects a pdb_dir input.
+
+    Specifications:
+    - Codebook size: 4096 tokens
+    - Embedding dimension: 256
+    - HuggingFace models: Mahdip72/gcp-vqvae-large (best) or Mahdip72/gcp-vqvae-lite (faster)
+    """
+
+    def __init__(self, device: torch.device | str = "cpu", hf_model_id: str = "Mahdip72/gcp-vqvae-large", **kwargs):
+        self.device = device
+        self.hf_model_id = hf_model_id
+
+        # Initialize the GCP-VQVAE model
+        device_str = str(device) if not isinstance(device, str) else device
+        self.model = GCPVQVAE(
+            mode="embed",
+            hf_model_id=hf_model_id,
+            device=device_str,
+            mixed_precision="no"  # Use fp32 to avoid bfloat16 numpy conversion issues
+        )
+
+        # Codebook size is 4096, embedding dim is 256, pad token is codebook_size
+        self.codebook_size = 4096
+        self.embedding_dim = 256
+        self.pad_token_id = self.codebook_size  # 4096 as pad token
+
+    def get_num_tokens(self):
+        return self.codebook_size + 1  # codebook + pad token
+
+    def get_codebook_embedding(self):
+        # Access codebook from loaded model: shape [1, 4096, 256] -> [4096, 256]
+        return self.model.model.vqvae.vector_quantizer._codebook.embed.squeeze(0)  # (4096, 256)
+
+    def encode_structure(self, pdb_path: str, chain_id: str, use_continuous: bool = False, use_sequence: bool = False):
+        """
+        Encode a single structure using GCP-VQVAE.
+        Uses temp directory since GCP-VQVAE expects pdb_dir input.
+
+        Note: GCP-VQVAE processes all chains in the structure, so we need to
+        extract residue indices from the original PDB to match labels.
+        """
+        import tempfile
+        import shutil
+
+        assert use_sequence
+
+        # Create temp dir with single PDB file
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # Copy PDB to temp dir
+            temp_pdb = os.path.join(temp_dir, os.path.basename(pdb_path))
+            shutil.copy(pdb_path, temp_pdb)
+
+            # Run embedding
+            records = self.model.embed(pdb_dir=temp_dir, batch_size=1)
+
+            if not records:
+                raise ValueError(f"Failed to embed structure: {pdb_path}")
+
+            record = records[0]
+            embedding = torch.tensor(record["embedding"])  # (L, 256)
+            indices = record["indices"]  # list of ints
+            seq = record["protein_sequence"]
+
+            # Convert to expected format
+            if use_continuous:
+                tokens = embedding  # (L, 256)
+            else:
+                tokens = torch.LongTensor(indices)  # (L,)
+
+            # Parse the PDB file to get actual residue indices
+            # GCP-VQVAE uses graphein which filters to CA atoms from standard residues
+            if pdb_path.endswith(".pdb"):
+                parser = PDB.PDBParser(QUIET=True)
+            else:
+                parser = PDB.MMCIFParser(QUIET=True)
+
+            structure = parser.get_structure("protein", pdb_path)
+
+            # Get residue indices from the appropriate chain
+            # GCP-VQVAE processes the first chain it finds by default
+            residues = []
+            for model in structure:
+                for chain in model:
+                    if chain_id == " " or chain.get_id() == chain_id:
+                        for residue in chain.get_residues():
+                            # Filter to standard amino acids with CA atom (like GCP-VQVAE does)
+                            if "CA" in residue and Bio.PDB.Polypeptide.is_aa(residue.get_resname(), standard=True):
+                                residues.append(residue)
+                        if residues:
+                            break
+                if residues:
+                    break
+
+            residue_index = np.array([res.get_id()[1] for res in residues])
+
+            # If lengths don't match, GCP-VQVAE may have filtered differently
+            # In this case, use 1-indexed as fallback
+            if len(residue_index) != len(seq):
+                residue_index = np.arange(1, len(seq) + 1)
+
+            # Convert sequence to AA indices
+            seqs = [Bio.PDB.Polypeptide.one_to_index(x) if x != "X" else 20 for x in seq]
+
+            return tokens, residue_index, seqs
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)

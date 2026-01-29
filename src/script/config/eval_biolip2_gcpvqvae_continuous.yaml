@@ -1,0 +1,59 @@
+# BioLIP2 Binding Site Evaluation - GCP-VQVAE Tokenizer - CONTINUOUS MODE
+# Run with: python run_supervised_task.py --config-name=eval_biolip2_gcpvqvae_continuous
+defaults:
+    - _self_
+    - trainer: base
+    - lightning: base
+    - data: biolip2
+    - optimization: base
+    - autorestart: base
+
+model:
+    class_name: "SequenceClassificationModel"
+    pretrained_ckpt_path: ""
+    ckpt_path: null
+    num_labels: 1
+    dropout: 0.1
+    num_layer: 1
+    hidden_size: 512
+    num_tokens: null
+    d_model: 256  # GCP-VQVAE encoder output dimension (same as codebook)
+    is_global_or_local: local
+    multi_label: false
+    regression: false
+    use_sequence: false
+    sequence_only: false
+    add_noise: null
+
+deepspeed_path: src/script/config/deepspeed/32_stage2.json
+default_data_dir: /home/romainlhardy/data/protein/struct_token_bench_release_data/
+tokenizer: WrappedGCPVQVAETokenizer
+tokenizer_pretrained_ckpt_path: null
+tokenizer_ckpt_name: GCPVQVAE
+
+max_steps: 5000
+experiment_name: biolip2_GCPVQVAE_continuous
+run_name: structured_eval
+validate_only: false
+test_only: false
+
+save_dir_path: ""
+results_dir: /home/romainlhardy/code/protein/logs/eval_results/
+tokenizer_device: "cuda"
+
+trainer:
+    default_root_dir: /home/romainlhardy/code/protein/logs/structtokenbench/
+precompute_tokens: true
+
+# GCP-VQVAE-specific parameters
+quantizer_use_linear_project: false
+model_encoder_dmodel: 1024
+model_encoder_nlayers: 2
+model_encoder_vheads: 128
+quantizer_codebook_size: 4096
+quantizer_codebook_embed_size: 256
+model_encoder_dout: 256
+
+data:
+    use_continuous: true  # Use continuous embeddings instead of discrete tokens
+    pdb_data_dir: /home/romainlhardy/data/protein/pdb_data/

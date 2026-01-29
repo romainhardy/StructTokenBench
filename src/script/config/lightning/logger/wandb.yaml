@@ -1,0 +1,5 @@
+_target_: pytorch_lightning.loggers.WandbLogger
+project: mcq_finetune
+name: ${...run_name}
+save_dir: ${...trainer.default_root_dir}
+log_model: false

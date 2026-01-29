@@ -38,7 +38,7 @@ class CATHLabelMappingDataset():
 
         # load cath_domain and its annotations
         file = os.path.join(self.data_path, self.CATH_STRUCTURAL_CLASSIFICATION_FILE)
-        cath_annot = pd.read_csv(file, comment="#", header=None, delim_whitespace=True)
+        cath_annot = pd.read_csv(file, comment="#", header=None, sep=r'\s+')
         cath_annot.columns = self.CATH_STRUCTURAL_CLASSIFICATION_FIELDS
         cath_annot["pdb_id"] = cath_annot["cath_domain"].apply(lambda x: x[:4])
         cath_annot["pdb_id_chain_id"] = cath_annot["cath_domain"].apply(lambda x: x[:5])

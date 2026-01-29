@@ -1,0 +1,96 @@
+# High-capacity MCQ fine-tuning config for Swiss-Prot training
+# Designed to match AminoAseed's representation dimension (1024)
+#
+# Capacity comparison:
+# - AminoAseed: 512 tokens × 1024 dim = 524K codebook params, 1024-dim output
+# - This MCQ: 512 tokens × 128 dim/cb = 65K codebook params, 1024-dim output
+#   (8 codebooks × 64 tokens × 128 dim = 65,536 params)
+#
+# Key difference: MCQ uses 8x fewer codebook parameters but achieves same
+# output dimension by concatenating 8 sub-codebook embeddings (8 × 128 = 1024)
+
+defaults:
+    - pretrain  # Inherit base pretrain config
+    - _self_
+
+model:
+    class_name: "AminoAseedMCQFinetune"
+
+    # Path to pre-trained checkpoint (encoder + decoder weights)
+    pretrained_ckpt_path: /home/romainlhardy/code/protein/models/codebook_512x1024-1e+19-linear-fixed-last.ckpt/checkpoint/mp_rank_00_model_states.pt
+
+    # Fine-tuning configuration
+    freeze_encoder: true      # Freeze pre-trained encoder
+    use_projection: true      # Add projection layer (encoder d_out -> MCQ dim)
+    warm_start_decoder: true  # Initialize decoder from pre-trained weights
+
+    # HIGH-CAPACITY MCQ Quantizer configuration
+    quantizer:
+        quantizer_type: MCQQuantizer
+        codebook_size: 512           # Total entries (512/8 = 64 per codebook)
+        codebook_embed_size: 1024    # Total embedding dim (1024/8 = 128 per codebook)
+        num_codebooks: 8             # Number of sub-codebooks
+        normalize_embeddings: true   # Use cosine similarity (L2 normalized)
+        _need_init: true             # Initialize codebooks from data on first forward
+        freeze_codebook: false       # Train codebooks
+
+        loss_weight:
+            commitment_loss_weight: 0.25
+            quantization_loss_weight: 1.0
+            reconstruction_loss_weight: 1.0
+
+    # Encoder config (must match pre-trained model)
+    encoder:
+        d_model: 1024
+        n_heads: 1
+        v_heads: 128
+        n_layers: 2
+        d_out: 1024  # Pre-trained encoder output dim
+
+    # Decoder config (must match pre-trained model)
+    decoder:
+        d_model: 1024
+        n_heads: 16
+        n_layers: 8
+
+# Dataset options:
+# - mmcif_files_filtered_subsample1.5: ~7.8K PDB structures (fast iteration)
+# - mmcif_files_filtered_subsample5: ~26K PDB structures
+# - mmcif_files_filtered_subsample10: ~52K PDB structures
+# - alphafold_swissprot: ~550K AlphaFold Swiss-Prot structures
+data:
+    data_version: alphafold_swissprot  # Use full Swiss-Prot dataset
+    pdb_data_dir: /home/romainlhardy/data/protein/pdb_data
+    skip_test_validation: true  # Skip CASP14/CAMEO test sets (require ESM3-tokenized data)
+
+# Training settings
+max_steps: 50000
+
+trainer:
+    default_root_dir: /home/romainlhardy/code/protein/logs/mcq_finetune_high_capacity
+    limit_train_batches: null
+    limit_val_batches: null
+
+# W&B logging
+lightning:
+    logger:
+        _target_: pytorch_lightning.loggers.WandbLogger
+        project: mcq_finetune
+        name: ${run_name}
+        save_dir: ${trainer.default_root_dir}
+        log_model: false
+
+experiment_name: mcq_finetune_high_capacity
+run_name: mcq_high_capacity_swissprot_50k
+
+# Optimization
+optimization:
+    scheduler:
+        num_warmup_steps: 2000  # Increased for 50k steps
+        num_training_steps: 50000
+
+# DeepSpeed config path
+deepspeed_path: /home/romainlhardy/code/protein/external/StructTokenBench/src/script/config/deepspeed/32_stage2.json
+
+# Data directory
+default_data_dir: /home/romainlhardy/data/protein/struct_token_bench_release_data

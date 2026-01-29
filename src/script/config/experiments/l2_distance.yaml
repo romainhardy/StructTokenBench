@@ -1,0 +1,12 @@
+# Experiment: L2 distance instead of cosine similarity
+# Tests whether cosine similarity is necessary or if L2 distance works
+defaults:
+    - _self_
+    - ../finetune_mcq
+
+model:
+    quantizer:
+        normalize_embeddings: false  # Use L2 distance instead of cosine similarity
+
+experiment_name: mcq_finetune_l2_distance
+run_name: l2_distance_v1

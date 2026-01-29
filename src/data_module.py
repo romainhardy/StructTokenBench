@@ -106,7 +106,13 @@ class ProteinDataModule(pl.LightningDataModule):
         
         if dataset.data_name not in ["ConformationalSwitchDataset", "CASP14Dataset", "CAMEODataset"]:
             for i in tqdm(range(len(dataset.data))):
-                assert len(dataset.data[i]["real_seqs"]) == len(dataset.data[i]["token_ids"])
+                token_ids = dataset.data[i]["token_ids"]
+                # Handle multi-codebook case (MCQ): token_ids has shape [num_codebooks, L]
+                if isinstance(token_ids, torch.Tensor) and token_ids.dim() == 2:
+                    token_len = token_ids.shape[-1]  # Use last dimension for sequence length
+                else:
+                    token_len = len(token_ids)
+                assert len(dataset.data[i]["real_seqs"]) == token_len
         return dataset
 
     def train_dataloader(self):
@@ -171,7 +177,10 @@ class PretrainingDataModule(pl.LightningDataModule):
         self.all_split_names = []
         if not self.test_only:
             self.all_split_names += ["validation"]
-        self.all_split_names += eval(self.data_args.data_name).SPLIT_NAME["test"]
+        # Only include test splits if skip_test_validation is not set
+        # (test splits require ESM3-tokenized data which may not be available)
+        if not getattr(self.data_args, 'skip_test_validation', False):
+            self.all_split_names += eval(self.data_args.data_name).SPLIT_NAME["test"]
 
         # to store device: tokenizer map to prevent multiple tokenizers on the same device
         self.device_tokenizer_map = {}

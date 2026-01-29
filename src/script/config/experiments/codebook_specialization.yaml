@@ -1,0 +1,16 @@
+# Experiment: Codebook specialization for multi-modal training
+# Different codebooks designated for different modalities
+defaults:
+    - _self_
+    - ../finetune_mcq
+
+model:
+    quantizer:
+        codebook_groups:
+            structure: [0, 1]  # Updated by reconstruction loss
+            sequence: [2, 3]   # Updated by forward folding loss
+            function: [4, 5]   # Updated by CLIP loss
+            shared: [6, 7]     # Updated by all losses
+
+experiment_name: mcq_finetune_specialized
+run_name: specialized_v1

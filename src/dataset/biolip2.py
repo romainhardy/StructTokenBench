@@ -87,7 +87,7 @@ class BioLIP2FunctionDataset(BaseDataset):
             self.filter_rare_ligand()
             torch.save(self.data, all_data_file)
         else:
-            self.data = torch.load(all_data_file)
+            self.data = torch.load(all_data_file, weights_only=False)
         
         # filter out entries without all four target labels
         self.filter_missing_labels()

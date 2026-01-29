@@ -1,0 +1,11 @@
+# Experiment: Warm-start decoder from pre-trained
+# Decoder initialized from pre-trained weights (default behavior)
+defaults:
+    - _self_
+    - ../finetune_mcq
+
+model:
+    warm_start_decoder: true
+
+experiment_name: mcq_finetune_warm_decoder
+run_name: warm_decoder_v1
