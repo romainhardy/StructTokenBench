@@ -82,6 +82,11 @@ try:
 except ModuleNotFoundError:
     print("[Warining]: ProteinMPNN not found")
 
+# ----- Kanzi Loading ------- #
+try:
+    from baselines.kanzi import WrappedKanziTokenizer
+except ModuleNotFoundError:
+    print("[Warning]: Kanzi not found")
 
 from vqvae_model import VQVAEModel
 
@@ -106,6 +111,7 @@ ALL_TOKENIZER_TYPE = {
         "WrappedAIDOTokenizer",
         "WrappedGCPVQVAETokenizer",
         "WrappedMCQTokenizer",
+        "WrappedKanziTokenizer",
     ],
     "continuous": [
         "WrappedMIFTokenizer",
@@ -465,7 +471,8 @@ class WrappedMCQTokenizer():
         with torch.no_grad():
             # Get encoder output using the model's encode method
             # The encode method already applies pre_vq_proj to get d_out dimension
-            encoder_out = self.model.encode(coords, attention_mask, residue_index=residue_index)
+            # NOTE: attention_mask has True=padding (from inf coords), but encoder expects True=valid
+            encoder_out = self.model.encode(coords, ~attention_mask, residue_index=residue_index)
 
             # Apply projection if encoder d_out doesn't match MCQ dimension
             if hasattr(self.model, 'projection') and not isinstance(self.model.projection, torch.nn.Identity):

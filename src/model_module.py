@@ -224,8 +224,9 @@ class SequenceClassificationModel(ProceedingBaseModel):
     def proceed_global_prediction(self, input_ids, input_mask, feature, targets):
 
         # averge pool for the last hidden state to get seq-level reprs.
+        # Note: input_mask is always 2D [B, L] even when input_ids is 3D [B, num_codebooks, L] (MCQ case)
         num_of_tokens = (~input_mask).sum(dim=1, keepdim=True)  # (B, 1) or (B, 1, dim)
-        if len(input_ids.shape) == 3:
+        if len(input_mask.shape) == 3:
             assert (num_of_tokens[:, :, :-1] == num_of_tokens[:, :,  :-1]).all()
             num_of_tokens = num_of_tokens[:, :, 0] # (B, 1)
 

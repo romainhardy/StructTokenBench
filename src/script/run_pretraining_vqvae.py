@@ -112,7 +112,9 @@ def main(cfg):
             # Barrier avoids checkpoint corruption if node 0 exits earlier than other
             # nodes, which can trigger worker node termination
             torch.distributed.barrier()
-        trainer.validate(model=model, datamodule=datamodule, ckpt_path="best")
+        # Only run validation if val_batches > 0
+        if getattr(cfg.trainer, "limit_val_batches", 1) != 0:
+            trainer.validate(model=model, datamodule=datamodule, ckpt_path="best")
     else:
         logger.info("*********** start validation ***********\n\n")
         trainer.validate(

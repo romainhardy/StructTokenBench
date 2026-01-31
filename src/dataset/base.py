@@ -433,6 +433,8 @@ class BaseDataset(Dataset):
             token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_path, chain_id, self.use_continuous, self.use_sequence)
         elif isinstance(self.tokenizer, WrappedMCQTokenizer):
             token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_chain, self.use_continuous, self.use_sequence)
+        elif isinstance(self.tokenizer, WrappedKanziTokenizer):
+            token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_path, chain_id, self.use_continuous, self.use_sequence)
         else:
             raise NotImplementedError
         

@@ -101,7 +101,9 @@ def extract_metrics_from_trainer(trainer, prefix: str = "") -> Dict[str, float]:
 
     Args:
         trainer: PyTorch Lightning Trainer instance
-        prefix: Filter metrics by prefix (e.g., "test_", "validation_")
+        prefix: Filter metrics by prefix (e.g., "test", "validation")
+                For "test", matches keys containing "_test_" or starting with "test_"
+                (e.g., "fold_test_auroc", "superfamily_test_loss", "test_fold_holdout_auroc")
 
     Returns:
         Dict of metric name -> value
@@ -110,8 +112,15 @@ def extract_metrics_from_trainer(trainer, prefix: str = "") -> Dict[str, float]:
     callback_metrics = trainer.callback_metrics
 
     for key, value in callback_metrics.items():
-        if prefix and not key.startswith(prefix):
-            continue
+        if prefix:
+            # For "test" prefix, match keys that contain "_test_" or start with "test_"
+            # This captures: fold_test_*, superfamily_test_*, test_fold_holdout_*, etc.
+            if prefix == "test":
+                if not ("_test_" in key or key.startswith("test_")):
+                    continue
+            # For other prefixes (like "validation"), use startswith
+            elif not key.startswith(prefix):
+                continue
         # Convert tensor to float if needed
         if hasattr(value, "item"):
             metrics[key] = value.item()

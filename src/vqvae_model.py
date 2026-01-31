@@ -1212,7 +1212,7 @@ class LightningVQPretrainModel(pl.LightningModule):
         ]
 
     def _valid_or_test_epoch_end(self, outputs, split="validation"):
-        
+
         agg_result = {k: [] for k in outputs[0].keys() if k.startswith(split)}
         for out in outputs:
             for k in out.keys():
@@ -1220,7 +1220,14 @@ class LightningVQPretrainModel(pl.LightningModule):
                     agg_result[k].append(out[k])
 
         for k in agg_result.keys():
-            agg_result[k] = torch.stack(agg_result[k]).mean()
+            # Convert floats to tensors for stacking
+            values = agg_result[k]
+            device = self.device
+            tensor_values = [
+                torch.tensor(v, device=device) if isinstance(v, (int, float)) else v.to(device)
+                for v in values
+            ]
+            agg_result[k] = torch.stack(tensor_values).mean()
 
         self.log_dict(
             agg_result, on_step=False, on_epoch=True, prog_bar=True,
