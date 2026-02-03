@@ -389,19 +389,31 @@ class WrappedOurPretrainedTokenizer():
 
 
 class WrappedMCQTokenizer():
-    """Tokenizer for MCQ-finetuned model with multi-codebook quantization."""
+    """Tokenizer for MCQ-finetuned model with multi-codebook quantization.
+
+    Supports loading checkpoints from protok (preferred) or local StructTokenBench.
+    """
 
     def __init__(self, device: torch.device | str = "cpu", model_cfg=None, pretrained_ckpt_path=None, ckpt_name=None):
         self.device = device
 
-        # Load MCQ model
-        from vqvae_finetune_model import AminoAseedMCQFinetune
-        self.model = AminoAseedMCQFinetune(model_cfg=model_cfg)
+        # Try importing from protok first (clean dependency), fall back to local
+        try:
+            from protok.models.vqvae import VQVAEModel
+            self.model = VQVAEModel(model_cfg)
+        except ImportError:
+            # Fallback to local StructTokenBench model
+            from vqvae_finetune_model import AminoAseedMCQFinetune
+            self.model = AminoAseedMCQFinetune(model_cfg=model_cfg)
 
-        # Load checkpoint (DeepSpeed format)
+        # Load checkpoint (supports DeepSpeed and Lightning formats)
         ckpt = torch.load(pretrained_ckpt_path, map_location=self.device)
         if "module" in ckpt:
+            # DeepSpeed format
             state_dict = ckpt["module"]
+        elif "state_dict" in ckpt:
+            # PyTorch Lightning format
+            state_dict = ckpt["state_dict"]
         else:
             state_dict = ckpt
 

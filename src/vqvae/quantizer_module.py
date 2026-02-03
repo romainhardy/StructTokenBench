@@ -194,6 +194,7 @@ class MCQQuantizer(nn.Module):
         _need_init: bool = True,
         freeze_codebook: bool = False,
         codebook_groups: dict = None,
+        ema_decay: float = 0.99,
         **kwargs
     ):
         super().__init__()
@@ -222,12 +223,19 @@ class MCQQuantizer(nn.Module):
         # If not provided, all codebooks receive gradients from all losses
         self.codebook_groups = codebook_groups
 
+        # EMA usage tracking
+        self.ema_decay = ema_decay
+
         self.codebooks = nn.ModuleList([
             nn.Embedding(self.sub_codebook_size, self.sub_embed_size)
             for _ in range(num_codebooks)
         ])
 
         self.register_buffer('vocab_usage', torch.zeros(num_codebooks, self.sub_codebook_size))
+        # EMA of code usage probability per codebook: [num_codebooks, sub_codebook_size]
+        self.register_buffer('ema_vocab_usage', torch.zeros(num_codebooks, self.sub_codebook_size))
+        # Count of EMA updates for adaptive smoothing (faster initial updates)
+        self.register_buffer('ema_update_count', torch.zeros(1, dtype=torch.long))
 
     def _get_normalized_codebook(self, codebook_idx: int) -> torch.Tensor:
         weight = self.codebooks[codebook_idx].weight
@@ -266,6 +274,33 @@ class MCQQuantizer(nn.Module):
     def get_codebook(self) -> torch.Tensor:
         weights = [cb.weight for cb in self.codebooks]
         return torch.stack(weights, dim=0)
+
+    @torch.no_grad()
+    def get_dead_codes(self, threshold: float = 0.01) -> dict:
+        """Identify dead codes based on EMA usage tracking.
+
+        Args:
+            threshold: Codes with usage below threshold * uniform_prob are considered dead.
+
+        Returns:
+            Dictionary with dead code indices per codebook and summary statistics.
+        """
+        uniform_prob = 1.0 / self.sub_codebook_size
+        dead_threshold = threshold * uniform_prob
+
+        dead_codes = {}
+        total_dead = 0
+        for i in range(self.num_codebooks):
+            dead_mask = self.ema_vocab_usage[i] < dead_threshold
+            dead_indices = torch.where(dead_mask)[0]
+            dead_codes[f"codebook_{i}"] = dead_indices.tolist()
+            total_dead += len(dead_indices)
+
+        dead_codes["total_dead"] = total_dead
+        dead_codes["total_codes"] = self.num_codebooks * self.sub_codebook_size
+        dead_codes["dead_ratio"] = total_dead / (self.num_codebooks * self.sub_codebook_size)
+
+        return dead_codes
 
     def embedding2indices(self, z: torch.Tensor) -> torch.Tensor:
         batch_size, seq_length, _ = z.shape
@@ -367,6 +402,8 @@ class MCQQuantizer(nn.Module):
 
         all_quantized = []
         all_indices = []
+        all_usage_probs = []  # For EMA tracking
+        all_logits = []  # For entropy loss
         total_commitment_loss = 0.0
         total_quantization_loss = 0.0
         total_vocab_usage = 0.0
@@ -385,6 +422,9 @@ class MCQQuantizer(nn.Module):
             if self.normalize_embeddings:
                 similarity = flat_chunk_norm @ codebook_weight.T
                 indices = torch.argmax(similarity, dim=1)
+                # Store logits for entropy loss (similarity-based)
+                if self.use_entropy_loss:
+                    all_logits.append(similarity / self.entropy_temp)
             else:
                 dist_sq = (
                     flat_chunk_norm.square().sum(dim=1, keepdim=True)
@@ -392,6 +432,9 @@ class MCQQuantizer(nn.Module):
                     - 2 * flat_chunk_norm @ codebook_weight.T
                 )
                 indices = torch.argmin(dist_sq, dim=1)
+                # Store logits for entropy loss (negative distance)
+                if self.use_entropy_loss:
+                    all_logits.append(-dist_sq / self.entropy_temp)
 
             quantized = F.embedding(indices, codebook_weight)
 
@@ -413,33 +456,90 @@ class MCQQuantizer(nn.Module):
             all_quantized.append(quantized)
             all_indices.append(indices)
 
-            # Track per-codebook usage
+            # Track per-codebook usage (instantaneous)
             with torch.no_grad():
                 unique_indices = torch.unique(indices)
                 usage = len(unique_indices)
                 total_vocab_usage += usage
-                per_codebook_usage.append(usage / self.sub_codebook_size)  # Utilization ratio
+                per_codebook_usage.append(usage / self.sub_codebook_size)
+
+                # Compute usage probability for this codebook
+                flat_indices = indices.flatten()
+                usage_counts = flat_indices.bincount(minlength=self.sub_codebook_size).float()
+
+                # Sync across distributed processes if available
+                if self.training and dist.is_initialized():
+                    dist.all_reduce(usage_counts)
+
+                usage_prob = usage_counts / (usage_counts.sum() + 1e-8)
+                all_usage_probs.append(usage_prob)
 
         quantized_z = torch.cat(all_quantized, dim=-1)
         quantized_indices = torch.stack(all_indices, dim=1)
 
+        # Update EMA usage tracking
+        if self.training:
+            with torch.no_grad():
+                self.ema_update_count += 1
+                # Adaptive decay: faster updates early, slower later (like UniTok)
+                if self.ema_update_count < 100:
+                    decay = 0.9
+                else:
+                    decay = self.ema_decay
+
+                for i, usage_prob in enumerate(all_usage_probs):
+                    self.ema_vocab_usage[i].mul_(decay).add_(usage_prob, alpha=1 - decay)
+
         avg_commitment_loss = total_commitment_loss / self.num_codebooks
         avg_quantization_loss = total_quantization_loss / self.num_codebooks
+
+        # Compute entropy loss if enabled
+        # Entropy loss = per_sample_entropy - codebook_entropy
+        # This encourages: (1) confident assignments, (2) uniform codebook usage
+        entropy_loss = torch.tensor(0.0, device=z.device)
+        if self.use_entropy_loss and len(all_logits) > 0:
+            total_entropy_loss = 0.0
+            for logits in all_logits:
+                # Per-sample entropy (encourage confident assignments)
+                probs = F.softmax(logits, dim=-1)
+                log_probs = F.log_softmax(logits, dim=-1)
+                per_sample_entropy = torch.mean((-probs * log_probs).sum(dim=-1))
+
+                # Codebook entropy (encourage uniform usage - maximize this)
+                avg_probs = probs.mean(dim=0)
+                codebook_entropy = (-avg_probs * torch.log(avg_probs + 1e-8)).sum()
+
+                # Loss: minimize per-sample entropy, maximize codebook entropy
+                total_entropy_loss += per_sample_entropy - codebook_entropy
+
+            entropy_loss = total_entropy_loss / self.num_codebooks
 
         loss = (
             self.loss_weight["commitment_loss_weight"] * avg_commitment_loss
             + self.loss_weight["quantization_loss_weight"] * avg_quantization_loss
+            + self.loss_weight.get("entropy_loss_weight", 0.0) * entropy_loss
         )
+
+        # Compute EMA-based utilization (codes with > 1% of uniform probability)
+        ema_utilization = []
+        uniform_threshold = 0.01 / self.sub_codebook_size
+        for i in range(self.num_codebooks):
+            active_codes = (self.ema_vocab_usage[i] > uniform_threshold).float().sum()
+            ema_utilization.append(active_codes.item() / self.sub_codebook_size)
 
         metrics = {
             "commitment_loss": avg_commitment_loss,
             "quantization_loss": avg_quantization_loss,
+            "entropy_loss": entropy_loss if isinstance(entropy_loss, float) else entropy_loss.item(),
             "vocab_usage": total_vocab_usage / self.num_codebooks,
             "avg_codebook_utilization": sum(per_codebook_usage) / len(per_codebook_usage),
+            "ema_avg_utilization": sum(ema_utilization) / len(ema_utilization),
         }
 
         # Add per-codebook utilization metrics
         for i, util in enumerate(per_codebook_usage):
             metrics[f"codebook_{i}_utilization"] = util
+        for i, util in enumerate(ema_utilization):
+            metrics[f"codebook_{i}_ema_utilization"] = util
 
         return quantized_z, quantized_indices, loss, metrics

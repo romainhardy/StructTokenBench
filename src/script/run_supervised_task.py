@@ -96,6 +96,10 @@ def main(cfg):
         tmp_cfg = omegaconf.OmegaConf.load(os.path.join(exc_dir, "./script/config/finetune_mcq.yaml"))["model"]
         tmp_cfg.quantizer.freeze_codebook = True
         tmp_cfg.quantizer._need_init = False
+        # Apply CLI overrides for MCQ parameters
+        tmp_cfg.quantizer.codebook_size = cfg.quantizer_codebook_size
+        tmp_cfg.quantizer.codebook_embed_size = cfg.quantizer_codebook_embed_size
+        tmp_cfg.encoder.d_out = cfg.model_encoder_dout
 
         pretrained_model_cfg = {
             "model_cfg": tmp_cfg,

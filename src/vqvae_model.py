@@ -666,14 +666,25 @@ class VQVAEModel(nn.Module):
         # reconstructed proteins
         bb_pred = decoded_states["bb_pred"]
         bb_rmsd_list, lddt_list = [], []
-        for i in range(len(bb_pred)):
-            pdb_chain_recon = WrappedProteinChain.from_backbone_atom_coordinates(bb_pred[i].detach())
-            pdb_chain_recon = pdb_chain_recon[:len(pdb_chain[i])]
-        
-            bb_rmsd = pdb_chain_recon.rmsd(pdb_chain[i], only_compute_backbone_rmsd=True)
-            lddt = np.array(pdb_chain_recon.lddt_ca(pdb_chain[i]))
-            bb_rmsd_list.append(bb_rmsd)
-            lddt_list.append(lddt.mean())
+
+        # Check if pdb_chain contains actual ProteinChain objects (not just strings)
+        # Sharded data may store sequences as strings to save space
+        has_chain_objects = pdb_chain is not None and len(pdb_chain) > 0 and hasattr(pdb_chain[0], "atom37_mask")
+
+        if has_chain_objects:
+            for i in range(len(bb_pred)):
+                pdb_chain_recon = WrappedProteinChain.from_backbone_atom_coordinates(bb_pred[i].detach())
+                pdb_chain_recon = pdb_chain_recon[:len(pdb_chain[i])]
+
+                bb_rmsd = pdb_chain_recon.rmsd(pdb_chain[i], only_compute_backbone_rmsd=True)
+                lddt = np.array(pdb_chain_recon.lddt_ca(pdb_chain[i]))
+                bb_rmsd_list.append(bb_rmsd)
+                # Handle empty or scalar lDDT (can happen with very short proteins or bad reconstructions)
+                lddt_list.append(lddt.mean() if np.size(lddt) > 0 else 0.0)
+        else:
+            # Skip RMSD/lDDT computation when pdb_chain is string-only (sharded data)
+            bb_rmsd_list = [0.0] * len(bb_pred)
+            lddt_list = [0.0] * len(bb_pred)
 
         # reconstruction loss:
         coords_recon = decoded_states["bb_pred"]

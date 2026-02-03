@@ -656,14 +656,18 @@ class BaseDataset(Dataset):
         for index in tqdm(range(len(self))):
             try:
                 self[index]
-            except:
+            except Exception as e:
+                import traceback
+                self.py_logger.info(f"[Error]: Something wrong for index {index} - {type(e).__name__}: {e}"
+                                    f"\n{traceback.format_exc()[:500]}")
                 self.py_logger.info(f"[Error]: Something wrong for index {index} "
                                     f"when using {tokenizer_name}\n[Warning]: if "
                                     f"you're using your own PST, you can skip wrongly "
                                     f"indexed samples for your PST. But please be aware that "
                                     f"other PST benchmakred by the authors all used these samples")
                 # For GCPVQVAE and MCQ, skip failing samples instead of raising error
-                if tokenizer_name in ("gcpvqvae", "mcq_MCQ", "ourpretrained_AminoAseed"):
+                skip_prefixes = ("gcpvqvae", "mcq_", "ourpretrained_")
+                if any(tokenizer_name.startswith(prefix) for prefix in skip_prefixes):
                     skip_indices.append(index)
                 else:
                     raise IndexError

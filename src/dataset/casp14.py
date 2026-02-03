@@ -125,9 +125,17 @@ class CASP14Dataset(BaseDataset):
             token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_path, chain_id, self.use_continuous, self.use_sequence)
         elif isinstance(self.tokenizer, WrappedOurPretrainedTokenizer):
             token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_chain, self.use_continuous, self.use_sequence) # torch.Tensors
+        elif isinstance(self.tokenizer, WrappedMCQTokenizer):
+            token_ids, residue_index, seqs = self.tokenizer.encode_structure(pdb_chain, self.use_continuous, self.use_sequence)
         else:
             raise NotImplementedError
-        assert len(token_ids) == len(residue_index)
+
+        # Handle multi-codebook case: MCQ returns [num_codebooks, L], others return [L]
+        if isinstance(token_ids, torch.Tensor) and token_ids.dim() == 2 and not self.use_continuous:
+            token_len = token_ids.shape[-1]  # Last dimension is sequence length
+        else:
+            token_len = len(token_ids)
+        assert token_len == len(residue_index)
 
         # select according to residue range constraints for some global tasks
         assert residue_range == [""]    

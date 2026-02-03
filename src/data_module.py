@@ -103,16 +103,17 @@ class ProteinDataModule(pl.LightningDataModule):
                 f"Precomputing tokenized ids on {process_global_rank} with world size {world_size}..."
             )
             dataset.cache_all_tokenized()
-        
-        if dataset.data_name not in ["ConformationalSwitchDataset", "CASP14Dataset", "CAMEODataset"]:
-            for i in tqdm(range(len(dataset.data))):
-                token_ids = dataset.data[i]["token_ids"]
-                # Handle multi-codebook case (MCQ): token_ids has shape [num_codebooks, L]
-                if isinstance(token_ids, torch.Tensor) and token_ids.dim() == 2:
-                    token_len = token_ids.shape[-1]  # Use last dimension for sequence length
-                else:
-                    token_len = len(token_ids)
-                assert len(dataset.data[i]["real_seqs"]) == token_len
+
+            # Verify token lengths match sequence lengths (only after precomputing)
+            if dataset.data_name not in ["ConformationalSwitchDataset", "CASP14Dataset", "CAMEODataset"]:
+                for i in tqdm(range(len(dataset.data))):
+                    token_ids = dataset.data[i]["token_ids"]
+                    # Handle multi-codebook case (MCQ): token_ids has shape [num_codebooks, L]
+                    if isinstance(token_ids, torch.Tensor) and token_ids.dim() == 2:
+                        token_len = token_ids.shape[-1]  # Use last dimension for sequence length
+                    else:
+                        token_len = len(token_ids)
+                    assert len(dataset.data[i]["real_seqs"]) == token_len
         return dataset
 
     def train_dataloader(self):
